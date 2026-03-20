@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""
-VidClipDuplis (VCD) v27
-=======================
+VidClipDuplis (VCD)
+===================
 Audio Duplicate & Clip Finder using Chromaprint (fpcalc).
 NAS-safe, file-based IPC, CPU-only.
 
@@ -13,13 +13,14 @@ Different videos with the same background music will match.
 Best for: movies, TV, music, lectures. Review results for meme/TikTok folders.
 
 Features:
+- Content-based cache keys (quick_hash) that survive file moves/renames
+- Byte-for-byte identical files detected instantly (no fingerprint comparison needed)
 - Multi-folder support (unlimited directories, comma/semicolon separated)
 - Interactive setup with cache management and CLI tips
 - Anonymous debug log for failures (no filenames logged)
 - Ctrl+C graceful shutdown with progress saving
 - Windows 8.3 short path + hardlink fallback for unsafe filenames
   (Chinese, Japanese, emoji, brackets, special characters)
-- Cache: .audio_cache_v1a.db
 
 Requirements: fpcalc.exe in script directory (from acoustid.org/chromaprint)
               pip install numpy tqdm
@@ -28,6 +29,7 @@ Requirements: fpcalc.exe in script directory (from acoustid.org/chromaprint)
 import os
 import sys
 import json
+import hashlib
 import subprocess
 import argparse
 import time
@@ -36,6 +38,7 @@ import signal
 import sqlite3
 import tempfile
 import logging
+import atexit
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -61,6 +64,38 @@ GLOBAL_ARRAYS: Dict[str, np.ndarray] = {}
 FPCALC_MAX_STDOUT_BYTES = 50 * 1024 * 1024
 _ARRAYS_TEMP_PATH: Optional[str] = None
 _debug_logger: Optional[logging.Logger] = None
+_INSTANCE_LOCK_FD: Optional[int] = None
+
+def acquire_instance_lock() -> bool:
+    """
+    Acquire an exclusive lock to prevent multiple instances from running.
+    Returns True if lock acquired, False if another instance is running.
+    """
+    global _INSTANCE_LOCK_FD
+    lock_path = os.path.join(_BASE_DIR, '.vcd_instance.lock')
+    
+    try:
+        # Open/create lock file
+        _INSTANCE_LOCK_FD = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        
+        if os.name == 'nt':
+            # Windows: use msvcrt for exclusive lock
+            import msvcrt
+            msvcrt.locking(_INSTANCE_LOCK_FD, msvcrt.LK_NBLCK, 1)
+        else:
+            # Unix: use fcntl
+            import fcntl
+            fcntl.flock(_INSTANCE_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        return True
+    except (OSError, IOError):
+        if _INSTANCE_LOCK_FD is not None:
+            try:
+                os.close(_INSTANCE_LOCK_FD)
+            except OSError:
+                pass
+            _INSTANCE_LOCK_FD = None
+        return False
 
 def setup_debug_logger(results_dir: str) -> logging.Logger:
     """Create anonymized debug log for fpcalc failures."""
@@ -77,31 +112,34 @@ def init_worker(arrays_file: str):
     global GLOBAL_ARRAYS
     import pickle
     import time
+    import signal
+    
+    # Workers must ignore Ctrl+C — only main process handles graceful shutdown
+    # Without this, Windows broadcasts SIGINT to all processes and workers crash
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    
     for attempt in range(10):
         try:
             with open(arrays_file, 'rb') as f:
                 GLOBAL_ARRAYS = pickle.load(f)
             return
-        except PermissionError:
+        except (PermissionError, FileNotFoundError):
             if attempt < 9:
                 time.sleep(0.5)
             else:
-                raise RuntimeError("Failed to load hash arrays: file locked (antivirus?)")
+                raise RuntimeError("Failed to load hash arrays: file locked or not found")
 
 def save_arrays_for_workers(hash_arrays: Dict[str, np.ndarray]) -> str:
     """Serialize hash_arrays to a temp file. Returns the filepath."""
+    global _ARRAYS_TEMP_PATH
     import pickle
-    fd, path = tempfile.mkstemp(suffix='.pkl', prefix='audiocache_arrays_')
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            pickle.dump(hash_arrays, f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception:
-        os.close(fd)
-        raise
-    return path
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', prefix='audiocache_arrays_', delete=False) as f:
+        pickle.dump(hash_arrays, f, protocol=pickle.HIGHEST_PROTOCOL)
+        _ARRAYS_TEMP_PATH = f.name
+        return f.name
 
 def cleanup_arrays_file():
-    """Remove the temp arrays file."""
+    """Remove the temp arrays file. Registered with atexit for crash safety."""
     global _ARRAYS_TEMP_PATH
     if _ARRAYS_TEMP_PATH and os.path.exists(_ARRAYS_TEMP_PATH):
         try:
@@ -109,6 +147,9 @@ def cleanup_arrays_file():
         except OSError:
             pass
         _ARRAYS_TEMP_PATH = None
+
+# Register cleanup for crash/kill scenarios
+atexit.register(cleanup_arrays_file)
 
 def fast_popcount_uint32(a: np.ndarray) -> np.ndarray:
     """Bare-metal bitwise popcount fallback for NumPy < 2.0."""
@@ -128,13 +169,26 @@ PROCESS_LOCK = threading.Lock()
 
 def signal_handler(signum, frame):
     global SHUTDOWN_REQUESTED, CTRL_C_COUNT
+    
+    # Only main process handles UI/cleanup; workers die silently
+    if multiprocessing.current_process().name != 'MainProcess':
+        return
+    
     CTRL_C_COUNT += 1
     if CTRL_C_COUNT >= 2:
         print("\n\n🛑 Force quitting — killing active processes...")
         with PROCESS_LOCK:
             for proc in ACTIVE_PROCESSES:
                 _kill_proc(proc)
+        
+        # Kill comparison workers so they don't linger in Task Manager
+        for child in multiprocessing.active_children():
+            child.kill()
+        
+        # Manually trigger cleanup that os._exit would skip
+        cleanup_arrays_file()
         os._exit(1)
+    
     SHUTDOWN_REQUESTED = True
     print("\n\n⚠️ Shutdown requested... Press Ctrl+C again to force quit.")
 
@@ -199,9 +253,17 @@ class UnionFind:
         self.parent = {}
         self.rank = {}
     def find(self, i):
-        if self.parent.setdefault(i, i) != i:
-            self.parent[i] = self.find(self.parent[i])
-        return self.parent[i]
+        # Iterative find with path compression (avoids recursion limit)
+        root = i
+        while self.parent.setdefault(root, root) != root:
+            root = self.parent[root]
+        # Path compression
+        curr = i
+        while curr != root:
+            nxt = self.parent[curr]
+            self.parent[curr] = root
+            curr = nxt
+        return root
     def union(self, i, j):
         ri, rj = self.find(i), self.find(j)
         if ri != rj:
@@ -209,6 +271,61 @@ class UnionFind:
             if rki < rkj: ri, rj = rj, ri
             self.parent[rj] = ri
             if rki == rkj: self.rank[ri] = rki + 1
+
+# ============================================================================
+# CONTENT-BASED HASHING
+# ============================================================================
+
+def _long_path_safe(path: str) -> str:
+    """Add Windows extended-length path prefix to handle paths exceeding MAX_PATH (260 chars)."""
+    if os.name == 'nt' and not path.startswith('\\\\?\\'):
+        abs_path = os.path.abspath(path)
+        if abs_path.startswith('\\\\'):
+            # Network share (UNC path): \\server\share → \\?\UNC\server\share
+            return '\\\\?\\UNC\\' + abs_path[2:]
+        else:
+            # Local drive letter: C:\path → \\?\C:\path
+            return '\\\\?\\' + abs_path
+    return path
+
+def get_quick_hash(filepath: str, chunk_size: int = 65536) -> Tuple[str, str]:
+    """
+    Compute a content-based hash that survives file moves and renames.
+    
+    Reads first 64KB + last 64KB + file_size → MD5 truncated to 16 chars.
+    This is fast even on NAS (only 128KB max read) while being unique enough
+    for deduplication purposes.
+    
+    Returns (hash, "") on success, ("", error_reason) on failure.
+    """
+    try:
+        # Use extended-length path on Windows to handle >260 char paths
+        safe_path = _long_path_safe(filepath)
+        file_size = os.path.getsize(safe_path)
+        hasher = hashlib.md5()
+        with open(safe_path, 'rb') as f:
+            # Read first chunk
+            first_chunk = f.read(chunk_size)
+            hasher.update(first_chunk)
+            
+            # Read last chunk if file is large enough
+            if file_size >= chunk_size * 2:
+                f.seek(-chunk_size, 2)  # 2 = SEEK_END
+                last_chunk = f.read(chunk_size)
+                hasher.update(last_chunk)
+            elif file_size > chunk_size:
+                # File is between 64KB and 128KB — read whatever's left
+                f.seek(chunk_size)
+                remaining = f.read()
+                hasher.update(remaining)
+            
+            # Include file size in hash to differentiate truncated versions
+            hasher.update(str(file_size).encode('utf-8'))
+        
+        return hasher.hexdigest()[:16], ""
+    except (OSError, IOError) as e:
+        # File might be locked, deleted, or on disconnected network share
+        return "", str(e)
 
 # ============================================================================
 # INTERACTIVE SETUP
@@ -244,7 +361,7 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
     print(f"        Local SSD:             8-12")
     print(f"    Comparison workers:  {comp_default}  (75% of {cpu_count} cores)")
     print(f"      These are CPU processes doing heavy math (XOR + popcount")
-    print(f"      on every chunk pair). This WILL pin your CPU at near 100%%.")
+    print(f"      on every chunk pair). This WILL pin your CPU at near 100%.")
     print(f"      Leave some cores free for your OS and other apps.")
     print(f"    Sensitivity:         {default_scale}/10  (balanced)")
     print(f"      1  = Very strict. Only near-identical audio. Almost no")
@@ -265,7 +382,7 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
     print(f"        5-10 GB files:  900s recommended")
     print(f"        10+ GB files:   1200s or more")
 
-    print(f"\n  Cache status:")
+    print(f"\n  Cache status (content-based keys — survives moves/renames):")
     fp_count = cache.get_fingerprint_count()
     cmp_count = cache.get_comparison_count()
     failed_count = cache.get_failed_count()
@@ -348,7 +465,14 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
 # ============================================================================
 
 class UnifiedCache:
-    """SQLite cache for fingerprints, comparisons, and failed files."""
+    """
+    SQLite cache for fingerprints, comparisons, and failed files.
+    Uses content-based keys (quick_hash) that survive file moves/renames.
+    
+    IMPORTANT: The disk scanner (os.walk) is the source of truth for which
+    files exist. The database only caches fingerprints and comparisons.
+    Multiple files with the same content_key are handled by the caller.
+    """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -367,16 +491,36 @@ class UnifiedCache:
 
     def _init_db(self):
         conn = self._get_conn()
+        
+        # Fingerprints: keyed by content_key (quick_hash)
+        # current_path is just for display; the disk scanner is the source of truth
         conn.execute("""CREATE TABLE IF NOT EXISTS fingerprints (
-            path TEXT PRIMARY KEY, file_size INTEGER, mtime REAL,
-            fingerprint BLOB, duration REAL, processed_at TEXT)""")
+            content_key TEXT PRIMARY KEY,
+            current_path TEXT,
+            file_size INTEGER,
+            fingerprint BLOB,
+            duration REAL,
+            processed_at TEXT)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fp_path ON fingerprints(current_path)")
+        
+        # Comparisons: keyed by (key1, key2) - both are content_keys
         conn.execute("""CREATE TABLE IF NOT EXISTS comparisons (
-            path1 TEXT NOT NULL, path2 TEXT NOT NULL,
-            match_ratio REAL NOT NULL, length_ratio REAL NOT NULL,
-            matched_seconds REAL NOT NULL, PRIMARY KEY (path1, path2))""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cmp_p1 ON comparisons(path1)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cmp_p2 ON comparisons(path2)")
-        conn.execute("CREATE TABLE IF NOT EXISTS failed_files (path TEXT PRIMARY KEY, reason TEXT)")
+            key1 TEXT NOT NULL,
+            key2 TEXT NOT NULL,
+            match_ratio REAL NOT NULL,
+            length_ratio REAL NOT NULL,
+            matched_seconds REAL NOT NULL,
+            PRIMARY KEY (key1, key2))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cmp_k1 ON comparisons(key1)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cmp_k2 ON comparisons(key2)")
+        
+        # Failed files: keyed by content_key
+        conn.execute("""CREATE TABLE IF NOT EXISTS failed_files (
+            content_key TEXT PRIMARY KEY,
+            last_path TEXT,
+            reason TEXT)""")
+        
+        # Cache parameters for auto-invalidation on algorithm changes
         conn.execute("CREATE TABLE IF NOT EXISTS cache_params (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
 
@@ -395,90 +539,237 @@ class UnifiedCache:
         if mismatched:
             print(f"   Warning: Algorithm params changed: {', '.join(mismatched)}")
             print(f"   Auto-clearing comparison cache")
-            conn.execute("DELETE FROM comparisons")
+            # DROP + CREATE is O(1) and avoids massive WAL bloat vs DELETE FROM
+            conn.execute("DROP TABLE IF EXISTS comparisons")
+            conn.execute("""CREATE TABLE comparisons (
+                key1 TEXT NOT NULL, key2 TEXT NOT NULL,
+                match_ratio REAL NOT NULL, length_ratio REAL NOT NULL,
+                matched_seconds REAL NOT NULL, PRIMARY KEY (key1, key2))""")
+            conn.execute("CREATE INDEX idx_cmp_k1 ON comparisons(key1)")
+            conn.execute("CREATE INDEX idx_cmp_k2 ON comparisons(key2)")
             conn.executemany("INSERT OR REPLACE INTO cache_params (key, value) VALUES (?, ?)", list(params.items()))
             conn.commit()
             return False
         return True
 
+    # ==================== FINGERPRINT METHODS ====================
+    
+    def get_fingerprint(self, content_key: str) -> Optional[Dict]:
+        """Look up fingerprint by content_key."""
+        if not content_key:
+            return None
+        try:
+            row = self._get_conn().execute(
+                "SELECT content_key, current_path, file_size, fingerprint, duration FROM fingerprints WHERE content_key=?",
+                (content_key,)
+            ).fetchone()
+            if row:
+                arr = np.frombuffer(row[3], dtype=np.uint32).copy() if row[3] else None
+                return {
+                    'content_key': row[0],
+                    'current_path': row[1],
+                    'file_size': row[2],
+                    'fingerprint': arr,
+                    'duration': row[4]
+                }
+        except sqlite3.Error as e:
+            print(f"Warning: Database error reading fingerprint: {e}")
+        return None
+
     def get_all_fingerprints(self) -> Dict[str, Dict]:
+        """Load all fingerprints keyed by content_key."""
         fps = {}
         try:
-            for row in self._get_conn().execute("SELECT path, file_size, mtime, fingerprint, duration FROM fingerprints"):
+            for row in self._get_conn().execute(
+                "SELECT content_key, current_path, file_size, fingerprint, duration FROM fingerprints"
+            ):
                 arr = np.frombuffer(row[3], dtype=np.uint32).copy() if row[3] else None
-                fps[row[0]] = {'file_size': row[1], 'mtime': row[2], 'duration': row[4], 'fingerprint': arr}
+                fps[row[0]] = {
+                    'content_key': row[0],
+                    'current_path': row[1],
+                    'file_size': row[2],
+                    'fingerprint': arr,
+                    'duration': row[4]
+                }
         except sqlite3.Error as e:
             print(f"Warning: Could not load fingerprints: {e}")
         return fps
 
-    def set_fingerprint(self, path, arr, size, mtime, duration):
+    def set_fingerprint(self, content_key: str, path: str, arr: Optional[np.ndarray], 
+                        size: int, duration: float):
+        """Store or update a fingerprint."""
         blob = arr.tobytes() if arr is not None else None
         try:
             conn = self._get_conn()
-            conn.execute("INSERT OR REPLACE INTO fingerprints (path,file_size,mtime,fingerprint,duration,processed_at) VALUES (?,?,?,?,?,datetime('now'))",
-                         (path, size, mtime, blob, duration))
+            conn.execute(
+                """INSERT OR REPLACE INTO fingerprints 
+                   (content_key, current_path, file_size, fingerprint, duration, processed_at) 
+                   VALUES (?,?,?,?,?,datetime('now'))""",
+                (content_key, path, size, blob, duration)
+            )
             conn.commit()
         except sqlite3.Error as e:
             print(f"Warning: Could not save fingerprint: {e}")
 
-    def get_many_comparisons(self, pairs):
-        results = {}
-        if not pairs: return results
-        conn = self._get_conn()
-        try:
-            conn.execute("CREATE TEMP TABLE IF NOT EXISTS temp_pairs (path1 TEXT, path2 TEXT)")
-            for i in range(0, len(pairs), 100000):
-                conn.execute("DELETE FROM temp_pairs")
-                conn.executemany("INSERT INTO temp_pairs VALUES (?,?)", pairs[i:i+100000])
-                for row in conn.execute("SELECT c.path1,c.path2,c.match_ratio,c.length_ratio,c.matched_seconds FROM temp_pairs t INNER JOIN comparisons c ON t.path1=c.path1 AND t.path2=c.path2"):
-                    results[(row[0], row[1])] = (row[2], row[3], row[4])
-            conn.execute("DELETE FROM temp_pairs")
-        except sqlite3.Error as e:
-            print(f"Warning: Batch lookup error: {e}")
-        return results
-
-    def batch_set_comparisons(self, results):
-        if not results: return
+    def update_path(self, content_key: str, new_path: str):
+        """Update the current_path for an existing fingerprint (file was moved/renamed)."""
         try:
             conn = self._get_conn()
-            conn.executemany("INSERT OR REPLACE INTO comparisons (path1,path2,match_ratio,length_ratio,matched_seconds) VALUES (?,?,?,?,?)", results)
+            conn.execute(
+                "UPDATE fingerprints SET current_path=? WHERE content_key=?",
+                (new_path, content_key)
+            )
+            conn.commit()
+        except sqlite3.Error:
+            pass
+
+    # ==================== COMPARISON METHODS ====================
+    
+    def _normalize_key_pair(self, k1: str, k2: str) -> Tuple[str, str]:
+        """Ensure consistent ordering for comparison lookup."""
+        return (k1, k2) if k1 <= k2 else (k2, k1)
+
+    def get_many_comparisons(self, pairs: List[Tuple[str, str]]) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
+        """
+        Batch lookup comparisons by content_key pairs.
+        Returns dict mapping (key1, key2) -> (match_ratio, length_ratio, matched_seconds)
+        """
+        results = {}
+        if not pairs:
+            return results
+        
+        conn = self._get_conn()
+        try:
+            # Process in chunks to avoid memory issues
+            for i in range(0, len(pairs), 100000):
+                # DROP + CREATE is faster than DELETE FROM for temp tables
+                conn.execute("DROP TABLE IF EXISTS temp_pairs")
+                conn.execute("CREATE TEMP TABLE temp_pairs (key1 TEXT, key2 TEXT)")
+                
+                # Normalize all pairs before lookup
+                normalized = [self._normalize_key_pair(k1, k2) for k1, k2 in pairs[i:i+100000]]
+                conn.executemany("INSERT INTO temp_pairs VALUES (?,?)", normalized)
+                
+                for row in conn.execute("""
+                    SELECT c.key1, c.key2, c.match_ratio, c.length_ratio, c.matched_seconds 
+                    FROM temp_pairs t 
+                    INNER JOIN comparisons c ON t.key1=c.key1 AND t.key2=c.key2
+                """):
+                    results[(row[0], row[1])] = (row[2], row[3], row[4])
+            
+            conn.execute("DROP TABLE IF EXISTS temp_pairs")
+        except sqlite3.Error as e:
+            print(f"Warning: Batch lookup error: {e}")
+        
+        return results
+
+    def batch_set_comparisons(self, results: List[Tuple[str, str, float, float, float]]):
+        """
+        Batch insert comparison results.
+        Each tuple is (key1, key2, match_ratio, length_ratio, matched_seconds).
+        Keys will be normalized internally.
+        """
+        if not results:
+            return
+        try:
+            conn = self._get_conn()
+            # Normalize pairs before insert
+            normalized = [
+                (*self._normalize_key_pair(k1, k2), mr, lr, ms) 
+                for k1, k2, mr, lr, ms in results
+            ]
+            conn.executemany(
+                "INSERT OR REPLACE INTO comparisons (key1, key2, match_ratio, length_ratio, matched_seconds) VALUES (?,?,?,?,?)",
+                normalized
+            )
             conn.commit()
         except sqlite3.Error as e:
             print(f"Warning: Batch insert error: {e}")
 
-    def wal_checkpoint(self):
-        try: self._get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error: pass
+    # ==================== FAILED FILE METHODS ====================
+    
+    def is_failed(self, content_key: str) -> bool:
+        """Check if a content_key is in the failed list."""
+        if not content_key:
+            return False
+        try:
+            return self._get_conn().execute(
+                "SELECT 1 FROM failed_files WHERE content_key=?", (content_key,)
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return False
 
-    def is_failed(self, path):
-        try: return self._get_conn().execute("SELECT 1 FROM failed_files WHERE path=?", (path,)).fetchone() is not None
-        except sqlite3.Error: return False
-
-    def mark_failed(self, path, reason):
+    def mark_failed(self, content_key: str, path: str, reason: str):
+        """Mark a file as failed (by content_key)."""
+        if not content_key:
+            return
         try:
             conn = self._get_conn()
-            conn.execute("INSERT OR REPLACE INTO failed_files (path,reason) VALUES (?,?)", (path, reason))
+            conn.execute(
+                "INSERT OR REPLACE INTO failed_files (content_key, last_path, reason) VALUES (?,?,?)",
+                (content_key, path, reason)
+            )
             conn.commit()
-        except sqlite3.Error: pass
+        except sqlite3.Error:
+            pass
 
+    # ==================== CACHE MANAGEMENT ====================
+    
     def clear_fingerprints(self):
-        try: c = self._get_conn(); c.execute("DELETE FROM fingerprints"); c.commit()
-        except sqlite3.Error: pass
+        try:
+            c = self._get_conn()
+            c.execute("DELETE FROM fingerprints")
+            c.commit()
+        except sqlite3.Error:
+            pass
+
     def clear_comparisons(self):
-        try: c = self._get_conn(); c.execute("DELETE FROM comparisons"); c.commit()
-        except sqlite3.Error: pass
+        try:
+            c = self._get_conn()
+            # DROP + CREATE is O(1) and avoids WAL bloat vs DELETE FROM on large tables
+            c.execute("DROP TABLE IF EXISTS comparisons")
+            c.execute("""CREATE TABLE comparisons (
+                key1 TEXT NOT NULL, key2 TEXT NOT NULL,
+                match_ratio REAL NOT NULL, length_ratio REAL NOT NULL,
+                matched_seconds REAL NOT NULL, PRIMARY KEY (key1, key2))""")
+            c.execute("CREATE INDEX idx_cmp_k1 ON comparisons(key1)")
+            c.execute("CREATE INDEX idx_cmp_k2 ON comparisons(key2)")
+            c.commit()
+        except sqlite3.Error:
+            pass
+
     def clear_failed(self):
-        try: c = self._get_conn(); c.execute("DELETE FROM failed_files"); c.commit()
-        except sqlite3.Error: pass
-    def get_failed_count(self):
-        try: return self._get_conn().execute("SELECT COUNT(*) FROM failed_files").fetchone()[0]
-        except sqlite3.Error: return 0
-    def get_comparison_count(self):
-        try: return self._get_conn().execute("SELECT COUNT(*) FROM comparisons").fetchone()[0]
-        except sqlite3.Error: return 0
-    def get_fingerprint_count(self):
-        try: return self._get_conn().execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0]
-        except sqlite3.Error: return 0
+        try:
+            c = self._get_conn()
+            c.execute("DELETE FROM failed_files")
+            c.commit()
+        except sqlite3.Error:
+            pass
+
+    def get_failed_count(self) -> int:
+        try:
+            return self._get_conn().execute("SELECT COUNT(*) FROM failed_files").fetchone()[0]
+        except sqlite3.Error:
+            return 0
+
+    def get_comparison_count(self) -> int:
+        try:
+            return self._get_conn().execute("SELECT COUNT(*) FROM comparisons").fetchone()[0]
+        except sqlite3.Error:
+            return 0
+
+    def get_fingerprint_count(self) -> int:
+        try:
+            return self._get_conn().execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0]
+        except sqlite3.Error:
+            return 0
+
+    def wal_checkpoint(self):
+        """Force WAL merge to prevent journal bloat."""
+        try:
+            self._get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
 
 # ============================================================================
 # EXTRACTION
@@ -488,18 +779,20 @@ def _drain_stderr(pipe, result_holder):
     try:
         result_holder[0] = pipe.read(4096)
         pipe.read()
-    except Exception: pass
+    except Exception:
+        pass
 
 def _kill_proc(proc):
-    if proc is None: return
-    try: proc.kill(); proc.wait(timeout=5)
-    except Exception: pass
+    if proc is None:
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
 
 def _get_short_path(long_path: str) -> str:
-    """
-    Convert a path to a DOS 8.3 short path for legacy C binaries.
-    Returns the original path if not on Windows or API fails.
-    """
+    """Convert a path to a DOS 8.3 short path for legacy C binaries."""
     if os.name != 'nt':
         return long_path
     try:
@@ -509,19 +802,26 @@ def _get_short_path(long_path: str) -> str:
         GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
         GetShortPathNameW.restype = wintypes.DWORD
         
-        abs_path = os.path.abspath(long_path)
+        # Use extended-length path to handle >260 char paths
+        abs_path = _long_path_safe(long_path)
         buf_size = GetShortPathNameW(abs_path, None, 0)
         if buf_size == 0:
             return long_path
         buffer = ctypes.create_unicode_buffer(buf_size)
         GetShortPathNameW(abs_path, buffer, buf_size)
-        return buffer.value
+        result = buffer.value
+        
+        # Strip \\?\ or \\?\UNC\ prefix — Windows cwd (SetCurrentDirectoryW) doesn't accept them
+        if result.startswith('\\\\?\\UNC\\'):
+            result = '\\\\' + result[8:]  # \\?\UNC\server\share → \\server\share
+        elif result.startswith('\\\\?\\'):
+            result = result[4:]  # \\?\C:\path → C:\path
+        
+        return result
     except Exception:
         return long_path
 
-# Characters that cause fpcalc/FFmpeg to choke:
-# [ ] are FFmpeg glob/sequence patterns
-# Non-ASCII triggers ANSI code page corruption in legacy C binaries
+# Characters that cause fpcalc/FFmpeg to choke
 _FPCALC_UNSAFE_CHARS = set('[]{}')
 
 def _is_fpcalc_safe(path: str) -> bool:
@@ -533,37 +833,50 @@ def _is_fpcalc_safe(path: str) -> bool:
 def _make_safe_path(original_path: str) -> Tuple[str, Optional[str]]:
     """
     Get an fpcalc-safe path. Tries 8.3 short path first.
-    If that still has unsafe chars, creates a temp hardlink (same volume, instant)
-    or temp copy (cross-volume) with a safe ASCII name.
+    If that still has unsafe chars, creates a temp hardlink or copy.
+    
+    CRITICAL: Temp file is created in the SAME DIRECTORY as the original
+    so that hardlinks work (hardlinks cannot cross volumes). This avoids
+    copying multi-GB files over the network.
     
     Returns (safe_path, cleanup_path_or_None).
-    If cleanup_path is not None, caller must delete it after use.
     """
-    # Try 8.3 short path first (instant, no copy)
+    import uuid
+    
     short = _get_short_path(original_path)
     if _is_fpcalc_safe(short):
         return short, None
     
-    # 8.3 didn't help — create a temp file with a safe name
-    # Use the same directory to try hardlink first (instant, zero-copy)
     ext = os.path.splitext(original_path)[1].lower()
     if not ext or not ext.isascii():
         ext = '.tmp'
     safe_ext = ''.join(c for c in ext if c.isalnum() or c == '.')
     
+    # Get the directory of the original file — MUST create temp here for hardlink to work
+    original_dir = os.path.dirname(os.path.abspath(original_path))
+    
     try:
-        # Try hardlink in temp dir (works if same volume, instant, no disk space)
-        fd, temp_path = tempfile.mkstemp(suffix=safe_ext, prefix='vcd_safe_')
-        os.close(fd)
-        os.remove(temp_path)  # Remove the empty file so hardlink can take its place
+        # Try hardlink in SAME directory (instant, zero-copy, same volume guaranteed)
+        # Use uuid to avoid race condition with mkstemp+delete on NAS
+        temp_path = os.path.join(original_dir, f'vcd_{uuid.uuid4().hex}{safe_ext}')
         os.link(original_path, temp_path)
         return temp_path, temp_path
     except OSError:
         pass
     
     try:
-        # Cross-volume: copy to temp (costs time + disk space but always works)
-        fd, temp_path = tempfile.mkstemp(suffix=safe_ext, prefix='vcd_safe_')
+        # Hardlink failed (maybe filesystem doesn't support it, or permissions, or read-only)
+        # Fall back to copy IN THE SAME DIRECTORY to avoid cross-volume copy
+        temp_path = os.path.join(original_dir, f'vcd_{uuid.uuid4().hex}{safe_ext}')
+        import shutil
+        shutil.copy2(original_path, temp_path)
+        return temp_path, temp_path
+    except OSError:
+        pass
+    
+    # Last resort: try system temp (will be slow for NAS files, but better than failing)
+    try:
+        fd, temp_path = tempfile.mkstemp(suffix=safe_ext, prefix='vcd_')
         os.close(fd)
         import shutil
         shutil.copy2(original_path, temp_path)
@@ -573,19 +886,30 @@ def _make_safe_path(original_path: str) -> Tuple[str, Optional[str]]:
         return original_path, None
 
 def extract_audio_fingerprint(args):
-    """Extract Chromaprint fingerprint. Returns 7-tuple including raw stderr for debug."""
-    path, size, mtime, video_timeout = args
+    """
+    Extract Chromaprint fingerprint.
+    Returns 7-tuple: (path, content_key, size, arr, duration, error, stderr_bytes)
+    """
+    path, content_key, size, video_timeout = args
     process = None
     cleanup_path = None
+    
     try:
         safe_path, cleanup_path = _make_safe_path(path)
-        cmd = [FPCALC_PATH, '-raw', '-length', '0', '-json', safe_path]
+        
+        # Use cwd= so fpcalc only sees the filename, not Unicode parent directories
+        # Windows handles the directory change natively, bypassing fpcalc's ANSI parsing
+        work_dir = os.path.dirname(os.path.abspath(safe_path))
+        filename_only = os.path.basename(safe_path)
+        cmd = [FPCALC_PATH, '-raw', '-length', '0', '-json', filename_only]
+        
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
 
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW)
+                                   startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW,
+                                   cwd=work_dir)
         with PROCESS_LOCK:
             ACTIVE_PROCESSES.append(process)
 
@@ -609,28 +933,27 @@ def extract_audio_fingerprint(args):
 
         if len(stdout_bytes) > FPCALC_MAX_STDOUT_BYTES:
             _kill_proc(process)
-            return path, size, mtime, None, 0.0, "fpcalc stdout exceeded 50MB cap", b''
+            return path, content_key, size, None, 0.0, "fpcalc stdout exceeded 50MB cap", b''
 
         if process.returncode != 0:
             err = stderr_bytes.decode('utf-8', errors='ignore').strip()[:200]
-            return path, size, mtime, None, 0.0, err or f"fpcalc exit code {process.returncode}", stderr_bytes
+            return path, content_key, size, None, 0.0, err or f"fpcalc exit code {process.returncode}", stderr_bytes
 
         data = json.loads(stdout_bytes.decode('utf-8'))
         fp = data.get('fingerprint', [])
         if not fp:
-            return path, size, mtime, None, 0.0, "Empty fingerprint (no audio stream?)", b''
-        return path, size, mtime, np.array(fp, dtype=np.uint32), data.get('duration', 0.0), "", b''
+            return path, content_key, size, None, 0.0, "Empty fingerprint (no audio stream?)", b''
+        return path, content_key, size, np.array(fp, dtype=np.uint32), data.get('duration', 0.0), "", b''
 
     except subprocess.TimeoutExpired:
         _kill_proc(process)
-        return path, size, mtime, None, 0.0, f"Timeout ({video_timeout}s)", b''
+        return path, content_key, size, None, 0.0, f"Timeout ({video_timeout}s)", b''
     except json.JSONDecodeError as e:
-        return path, size, mtime, None, 0.0, f"Invalid fpcalc JSON: {e}", b''
+        return path, content_key, size, None, 0.0, f"Invalid fpcalc JSON: {e}", b''
     except Exception as e:
         _kill_proc(process)
-        return path, size, mtime, None, 0.0, str(e)[:200], b''
+        return path, content_key, size, None, 0.0, str(e)[:200], b''
     finally:
-        # Always clean up temp hardlink/copy
         if cleanup_path:
             try:
                 os.remove(cleanup_path)
@@ -641,15 +964,16 @@ def extract_audio_fingerprint(args):
 # COMPARISON
 # ============================================================================
 
-def compare_audio_pair(path1, path2, config):
-    """Compare two fingerprints. Returns raw metrics (no early exit)."""
+def compare_audio_pair(key1: str, key2: str, config: Config):
+    """Compare two fingerprints by content_key. Returns raw metrics (no early exit)."""
     global GLOBAL_ARRAYS
-    arr1, arr2 = GLOBAL_ARRAYS.get(path1), GLOBAL_ARRAYS.get(path2)
+    arr1, arr2 = GLOBAL_ARRAYS.get(key1), GLOBAL_ARRAYS.get(key2)
     if arr1 is None or arr2 is None:
-        return path1, path2, 0.0, 0.0, 0.0
+        return key1, key2, 0.0, 0.0, 0.0
+    
     arr_short, arr_long = (arr1, arr2) if len(arr1) <= len(arr2) else (arr2, arr1)
     if len(arr_short) < config.chunk_size:
-        return path1, path2, 0.0, 0.0, 0.0
+        return key1, key2, 0.0, 0.0, 0.0
 
     length_ratio = abs(len(arr_short) - len(arr_long)) / max(len(arr_short), len(arr_long))
     num_chunks = len(arr_short) // config.chunk_size
@@ -668,9 +992,9 @@ def compare_audio_pair(path1, path2, config):
 
     match_ratio = matched_chunks / num_chunks if num_chunks else 0.0
     matched_seconds = matched_chunks * (config.chunk_size / 6.0)
-    return path1, path2, match_ratio, length_ratio, matched_seconds
+    return key1, key2, match_ratio, length_ratio, matched_seconds
 
-def classify_comparison(match_ratio, length_ratio, matched_seconds, config):
+def classify_comparison(match_ratio: float, length_ratio: float, matched_seconds: float, config: Config):
     """Apply thresholds to raw metrics. Returns (is_dup, is_clip)."""
     if matched_seconds < config.intro_filter_seconds and match_ratio > 0:
         return False, False
@@ -678,11 +1002,13 @@ def classify_comparison(match_ratio, length_ratio, matched_seconds, config):
     is_clip = not is_dup and match_ratio >= config.clip_match_ratio
     return is_dup, is_clip
 
-def compare_batch(batch, config):
+def compare_batch(batch: List[Tuple[str, str]], config: Config):
+    """Compare a batch of content_key pairs."""
     results = []
-    for p1, p2 in batch:
-        _, _, mr, lr, ms = compare_audio_pair(p1, p2, config)
-        results.append((*_normalize_pair(p1, p2), mr, lr, ms))
+    for k1, k2 in batch:
+        _, _, mr, lr, ms = compare_audio_pair(k1, k2, config)
+        nk1, nk2 = (k1, k2) if k1 <= k2 else (k2, k1)  # Normalize
+        results.append((nk1, nk2, mr, lr, ms))
     return results
 
 # ============================================================================
@@ -690,11 +1016,9 @@ def compare_batch(batch, config):
 # ============================================================================
 
 def _html_escape(s: str) -> str:
-    """Escape HTML special characters."""
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
 
 def _js_escape(s: str) -> str:
-    """Escape string for JavaScript."""
     return s.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
 
 def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints, display_root, total_delete, total_savings):
@@ -723,6 +1047,7 @@ def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints,
             'files': files_js,
             'savings_fmt': format_size(g['potential_savings']),
             'size_warning': g.get('size_warning', False),
+            'identical': g.get('identical', False),
         })
 
     clips_js = []
@@ -758,12 +1083,14 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 .summary .stat .label {{ font-size: 12px; color: #888; }}
 .card {{ background: #16213e; border-radius: 8px; padding: 20px; margin-bottom: 15px; border-left: 4px solid #0f3460; }}
 .card.warning {{ border-left-color: #e9a045; }}
+.card.identical {{ border-left-color: #4ecca3; }}
 .card-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
 .card-title {{ font-weight: bold; font-size: 16px; }}
 .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }}
 .badge-warn {{ background: #e9a045; color: #000; }}
 .badge-savings {{ background: #0f3460; color: #e0e0e0; }}
 .badge-clip {{ background: #533483; color: #e0e0e0; }}
+.badge-identical {{ background: #4ecca3; color: #000; }}
 .file-row {{ background: #0f3460; border-radius: 6px; padding: 12px 15px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: background 0.15s; }}
 .file-row:hover {{ background: #1a4a8a; }}
 .file-row.selected-keep {{ border: 2px solid #4ecca3; background: #0f3460; }}
@@ -812,8 +1139,6 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 <script>
 const DATA = {data_json};
 
-// State: for each group, which file index is "keep", and optional rename source
-// state[groupId] = {{ keep: fileIdx, rename_from: fileIdx|null, action: 'decided'|'skipped' }}
 const state = {{}};
 const clipState = {{}};
 
@@ -827,14 +1152,15 @@ function init() {{
   }}
 
   DATA.groups.forEach((g, gi) => {{
-    // Default: largest file is keep
     const keepIdx = g.files.findIndex(f => f.is_keep);
     state[gi] = {{ keep: keepIdx >= 0 ? keepIdx : 0, rename_from: null, action: 'decided' }};
 
-    let warn = g.size_warning ? ' warning' : '';
-    let warnBadge = g.size_warning ? ' <span class="badge badge-warn">SIZE MISMATCH</span>' : '';
+    let warn = g.size_warning ? ' warning' : (g.identical ? ' identical' : '');
+    let badges = '';
+    if (g.identical) badges += ' <span class="badge badge-identical">IDENTICAL FILES</span>';
+    if (g.size_warning) badges += ' <span class="badge badge-warn">SIZE MISMATCH</span>';
     let html = '<div class="card' + warn + '" id="group-' + gi + '">';
-    html += '<div class="card-header"><span class="card-title">Group ' + (gi+1) + ' (' + g.files.length + ' files)' + warnBadge + '</span>';
+    html += '<div class="card-header"><span class="card-title">Group ' + (gi+1) + ' (' + g.files.length + ' files)' + badges + '</span>';
     html += '<span class="badge badge-savings">Save ' + g.savings_fmt + '</span></div>';
 
     g.files.forEach((f, fi) => {{
@@ -893,7 +1219,6 @@ function setKeep(gi, fi) {{
 }}
 
 function setDelete(gi, fi) {{
-  // Set the OTHER file as keep
   const otherIdx = DATA.groups[gi].files.findIndex((_, i) => i !== fi);
   if (otherIdx >= 0) {{ state[gi].keep = otherIdx; }}
   state[gi].rename_from = null;
@@ -903,11 +1228,7 @@ function setDelete(gi, fi) {{
 }}
 
 function setRename(gi, fi) {{
-  // Keep the current "keep" file, but rename it to this file's name
-  if (state[gi].keep === fi) {{
-    // Can't rename to yourself — pick another keep first
-    return;
-  }}
+  if (state[gi].keep === fi) {{ return; }}
   state[gi].rename_from = fi;
   state[gi].action = 'decided';
   updateGroupRows(gi);
@@ -958,7 +1279,7 @@ function updateCounters() {{
   let dels = 0, renames = 0, skips = 0;
   DATA.groups.forEach((g, gi) => {{
     if (state[gi].action === 'skipped') {{ skips++; return; }}
-    dels += g.files.length - 1; // all except keep
+    dels += g.files.length - 1;
     if (state[gi].rename_from !== null) renames++;
   }});
   DATA.clips.forEach((_, ci) => {{ if (clipState[ci]) dels++; }});
@@ -985,7 +1306,6 @@ function generateScript() {{
 
     lines.push('# Group ' + (gi+1));
 
-    // Delete all non-keep files
     g.files.forEach((f, fi) => {{
       if (fi !== keepIdx) {{
         const p = f.path.replace(/'/g, "''");
@@ -993,7 +1313,6 @@ function generateScript() {{
       }}
     }});
 
-    // Rename if requested
     if (state[gi].rename_from !== null) {{
       const srcName = g.files[state[gi].rename_from].filename;
       const keepDir = keepFile.dir;
@@ -1005,7 +1324,6 @@ function generateScript() {{
     lines.push('');
   }});
 
-  // Clips
   let hasClips = false;
   DATA.clips.forEach((c, ci) => {{
     if (clipState[ci]) {{
@@ -1018,7 +1336,8 @@ function generateScript() {{
   lines.push('');
   lines.push('Write-Host "Done!" -ForegroundColor Green');
 
-  const blob = new Blob([lines.join('\\r\\n')], {{ type: 'text/plain' }});
+  // Add UTF-8 BOM so PowerShell correctly reads Unicode paths
+  const blob = new Blob(['\\ufeff' + lines.join('\\r\\n')], {{ type: 'text/plain' }});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'custom_actions.ps1';
@@ -1040,16 +1359,26 @@ init();
 # ============================================================================
 
 def find_media_files(root_dir):
+    """Scan directory for media files. Returns list of (path, size, mtime).
+    
+    Uses os.walk instead of pathlib.rglob for significantly faster NAS scanning.
+    """
     files, seen = [], set()
-    for p in Path(root_dir).rglob('*'):
-        if not p.is_file() or p.suffix.lower() not in MEDIA_EXTENSIONS: continue
-        key = str(p).lower()
-        if key in seen: continue
-        seen.add(key)
-        try:
-            st = p.stat()
-            files.append((str(p), st.st_size, st.st_mtime))
-        except OSError: pass
+    for dirpath, _, filenames in os.walk(root_dir):
+        for name in filenames:
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in MEDIA_EXTENSIONS:
+                continue
+            p = os.path.join(dirpath, name)
+            key = p.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                st = os.stat(p)
+                files.append((p, st.st_size, st.st_mtime))
+            except OSError:
+                pass
     return files
 
 # ============================================================================
@@ -1059,6 +1388,12 @@ def find_media_files(root_dir):
 def main():
     global SHUTDOWN_REQUESTED, _ARRAYS_TEMP_PATH, _debug_logger
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Prevent multiple instances from corrupting the database
+    if not acquire_instance_lock():
+        print("🛑 Another instance of VidClipDuplis is already running.")
+        print("   Wait for it to finish, or close it before starting a new scan.")
+        sys.exit(1)
 
     if not os.path.exists(FPCALC_PATH):
         print(f"❌ CRITICAL: {FPCALC_PATH} not found.")
@@ -1093,9 +1428,10 @@ def main():
     print("  It works regardless of video resolution, codec, or bitrate")
     print("  because it only looks at the audio track.")
     print()
+    print("  Cache survives file moves and renames!")
     print("  Works on any CPU (Intel, AMD, ARM). No GPU needed.")
 
-    # Resolve directories — support multiple via CLI args or interactive prompt
+    # Resolve directories
     if args.directories:
         root_dirs = [os.path.abspath(d) for d in args.directories]
     else:
@@ -1113,7 +1449,6 @@ def main():
                 else:
                     print("  ❌ At least one folder is required.")
                     continue
-            # Split by ; or , for multi-path entry
             for part in dir_input.replace(';', ',').split(','):
                 part = part.strip().strip('"').strip("'")
                 if part:
@@ -1125,33 +1460,45 @@ def main():
             sys.exit(1)
 
     # Configuration
-    try: cpu_count = multiprocessing.cpu_count()
-    except Exception: cpu_count = 4
+    try:
+        cpu_count = multiprocessing.cpu_count()
+    except Exception:
+        cpu_count = 4
 
     script_dir = _BASE_DIR
-    cache_path = os.path.join(script_dir, '.audio_cache_v1a.db')
+    cache_path = os.path.join(script_dir, '.audio_cache.db')
     cache = UnifiedCache(cache_path)
 
-    # Handle CLI cache clearing first
+    # Handle CLI cache clearing
     if args.clear_cache:
-        cache.clear_fingerprints(); cache.clear_comparisons(); cache.clear_failed()
+        cache.clear_fingerprints()
+        cache.clear_comparisons()
+        cache.clear_failed()
         print("🗑️  All caches cleared")
     if args.clear_comparisons:
-        cache.clear_comparisons(); print("🗑️  Comparison cache cleared")
+        cache.clear_comparisons()
+        print("🗑️  Comparison cache cleared")
     if args.clear_failed:
-        cache.clear_failed(); print("🗑️  Failed list cleared")
+        cache.clear_failed()
+        print("🗑️  Failed list cleared")
 
     has_cli_config = (args.workers > 0 or args.compare_workers > 0 or args.clip_ratio > 0
                       or args.dup_ratio > 0 or args.intro_filter >= 0 or args.no_prompt)
 
     if has_cli_config:
         config = Config(video_timeout=args.timeout)
-        if args.workers > 0: config.max_workers = args.workers
-        if args.compare_workers > 0: config.comparison_workers = args.compare_workers
-        else: config.comparison_workers = max(4, int(cpu_count * 0.75))
-        if args.clip_ratio > 0: config.clip_match_ratio = max(0.01, min(1.0, args.clip_ratio))
-        if args.dup_ratio > 0: config.duplicate_match_ratio = max(0.01, min(1.0, args.dup_ratio))
-        if args.intro_filter >= 0: config.intro_filter_seconds = args.intro_filter
+        if args.workers > 0:
+            config.max_workers = args.workers
+        if args.compare_workers > 0:
+            config.comparison_workers = args.compare_workers
+        else:
+            config.comparison_workers = max(4, int(cpu_count * 0.75))
+        if args.clip_ratio > 0:
+            config.clip_match_ratio = max(0.01, min(1.0, args.clip_ratio))
+        if args.dup_ratio > 0:
+            config.duplicate_match_ratio = max(0.01, min(1.0, args.dup_ratio))
+        if args.intro_filter >= 0:
+            config.intro_filter_seconds = args.intro_filter
     else:
         config = interactive_setup(cpu_count, cache)
 
@@ -1165,9 +1512,10 @@ def main():
     print(f"   Intro filter:        {config.intro_filter_seconds}s")
     print(f"   Cache: {cache_path}")
 
-    # Phase 0: Scan
+    # Phase 0: Scan files
     for d in root_dirs:
         print(f"\n📂 Scanning: {d}")
+    
     media_files = []
     seen_paths = set()
     for d in root_dirs:
@@ -1175,59 +1523,140 @@ def main():
             if item[0].lower() not in seen_paths:
                 seen_paths.add(item[0].lower())
                 media_files.append(item)
+    
     if not media_files:
-        print("   ❌ No media files found"); sys.exit(0)
+        print("   ❌ No media files found")
+        sys.exit(0)
 
     total_size = sum(s for _, s, _ in media_files)
     print(f"   Found {len(media_files)} files ({format_size(total_size)})")
 
-    all_cached = cache.get_all_fingerprints()
-    to_process, fingerprints, skipped_failed = [], {}, 0
-    for path, size, mtime in media_files:
-        if cache.is_failed(path): skipped_failed += 1; continue
-        cached = all_cached.get(path)
-        if cached and cached['file_size'] == size and abs(cached['mtime'] - mtime) < 1:
-            fingerprints[path] = cached
+    # Phase 0.5: Compute content keys and build content_key -> [paths] mapping
+    # THIS MAPPING IS THE SOURCE OF TRUTH — not the database!
+    print(f"\n🔑 Computing content keys...")
+    key_to_paths: Dict[str, List[Tuple[str, int, float]]] = defaultdict(list)  # content_key -> [(path, size, mtime), ...]
+    hash_errors = []  # (path, error_reason) for logging
+    
+    for path, size, mtime in tqdm(media_files, unit="file", desc="   Hashing"):
+        content_key, hash_err = get_quick_hash(path)
+        if content_key:
+            key_to_paths[content_key].append((path, size, mtime))
         else:
-            to_process.append((path, size, mtime))
+            hash_errors.append((path, hash_err))
+    
+    if hash_errors:
+        print(f"   ⚠️  {len(hash_errors)} files could not be hashed:")
+        for failed_path, reason in hash_errors[:5]:
+            print(f"      • {os.path.basename(failed_path)}: {reason[:60]}")
+        if len(hash_errors) > 5:
+            print(f"      ... and {len(hash_errors) - 5} more (see debug log)")
+    
+    # Count byte-for-byte identical files (same content_key, multiple paths)
+    identical_groups = [(ck, paths) for ck, paths in key_to_paths.items() if len(paths) > 1]
+    unique_keys = len(key_to_paths)
+    total_with_keys = sum(len(paths) for paths in key_to_paths.values())
+    
+    print(f"   ✓ {total_with_keys} files → {unique_keys} unique content keys")
+    if identical_groups:
+        identical_file_count = sum(len(paths) for _, paths in identical_groups)
+        print(f"   🔥 {len(identical_groups)} groups of byte-for-byte identical files ({identical_file_count} files)")
+        print(f"      These will be reported as duplicates WITHOUT fingerprint comparison!")
+
+    # Load cached fingerprints
+    all_cached_fps = cache.get_all_fingerprints()  # keyed by content_key
+    
+    # Determine what needs processing
+    # We only need ONE fingerprint per content_key (since identical files have identical audio)
+    to_process = []  # (path, content_key, size, mtime) - one representative per content_key
+    fingerprints = {}  # content_key -> fingerprint data
+    skipped_failed = 0
+    path_updates = []  # (content_key, new_path) for files that moved
+    
+    for content_key, paths in key_to_paths.items():
+        # Pick one representative path for this content_key
+        rep_path, rep_size, rep_mtime = paths[0]
+        
+        # Check if this content_key is marked as failed
+        if cache.is_failed(content_key):
+            skipped_failed += len(paths)  # All paths with this key are effectively failed
+            continue
+        
+        # Check if we have a cached fingerprint for this content_key
+        cached = all_cached_fps.get(content_key)
+        if cached and cached.get('fingerprint') is not None:
+            # Validate that file_size still matches (sanity check)
+            if cached['file_size'] == rep_size:
+                fingerprints[content_key] = {
+                    'content_key': content_key,
+                    'file_size': rep_size,
+                    'duration': cached['duration'],
+                    'fingerprint': cached['fingerprint']
+                }
+                # Track if path changed (file was moved/renamed)
+                if cached.get('current_path') != rep_path:
+                    path_updates.append((content_key, rep_path))
+            else:
+                # File size changed — content changed, need to re-extract
+                to_process.append((rep_path, content_key, rep_size, rep_mtime))
+        else:
+            # No cached fingerprint
+            to_process.append((rep_path, content_key, rep_size, rep_mtime))
+    
+    # Batch update paths for moved files
+    if path_updates:
+        print(f"   📁 {len(path_updates)} files moved/renamed — updating cache paths...")
+        for content_key, new_path in path_updates:
+            cache.update_path(content_key, new_path)
 
     print(f"\n📦 Status:")
-    print(f"   Cached: {len(fingerprints)}")
+    print(f"   Unique content keys: {unique_keys}")
+    print(f"   Fingerprints cached: {len(fingerprints)}")
     print(f"   To process: {len(to_process)}")
-    if skipped_failed: print(f"   Skipped failed: {skipped_failed}")
+    if skipped_failed:
+        print(f"   Skipped failed: {skipped_failed}")
 
-    # Set up results dir and debug log early
+    # Set up results dir and debug log
     results_dir = get_results_folder_path(script_dir, root_dirs)
-    if to_process:
+    if to_process or hash_errors:
         os.makedirs(results_dir, exist_ok=True)
         _debug_logger = setup_debug_logger(results_dir)
+        
+        # Log hash errors to debug file
+        if hash_errors and _debug_logger:
+            for failed_path, reason in hash_errors:
+                _debug_logger.debug(f"HASH_FAIL | {reason}")
 
-    # Phase 1: Extraction
+    # Phase 1: Extraction (only for unique content_keys that aren't cached)
     if to_process and not SHUTDOWN_REQUESTED:
-        print(f"\n🎵 Phase 1: Extracting audio fingerprints ({len(to_process)} files)...")
+        print(f"\n🎵 Phase 1: Extracting audio fingerprints ({len(to_process)} unique files)...")
         print(f"   ⌨️  Press Ctrl+C once to stop gracefully, twice to force quit.")
-        extraction_args = [(p, s, m, config.video_timeout) for p, s, m in to_process]
+        
+        extraction_args = [(p, ck, s, config.video_timeout) for p, ck, s, m in to_process]
         pbar = tqdm(total=len(to_process), unit="file")
         failed_count = 0
+        
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
             futures = {executor.submit(extract_audio_fingerprint, item): item for item in extraction_args}
             for future in as_completed(futures):
                 if SHUTDOWN_REQUESTED:
-                    executor.shutdown(wait=False, cancel_futures=True); break
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
                 try:
-                    path, size, mtime, arr, duration, err, stderr_raw = future.result()
+                    path, content_key, size, arr, duration, err, stderr_raw = future.result()
                     if arr is not None:
-                        fingerprints[path] = {'file_size': size, 'mtime': mtime, 'duration': duration, 'fingerprint': arr}
-                        cache.set_fingerprint(path, arr, size, mtime, duration)
+                        fingerprints[content_key] = {
+                            'content_key': content_key,
+                            'file_size': size,
+                            'duration': duration,
+                            'fingerprint': arr
+                        }
+                        cache.set_fingerprint(content_key, path, arr, size, duration)
                     else:
-                        cache.mark_failed(path, err)
+                        cache.mark_failed(content_key, path, err)
                         failed_count += 1
                         tqdm.write(f"   ❌ {err} — {os.path.basename(path)}")
                         if _debug_logger:
                             ext = os.path.splitext(path)[1].lower()
-                            # Scrub any occurrence of the file path from error/stderr
-                            # to keep the log truly anonymous (fpcalc and Python exceptions
-                            # both embed the full path in their error strings)
                             safe_err = err
                             safe_stderr = stderr_raw.decode('utf-8', errors='ignore').strip()[:500] if stderr_raw else ''
                             for variant in (path, os.path.abspath(path), os.path.basename(path)):
@@ -1243,127 +1672,246 @@ def main():
             print(f"   📋 Debug log: {os.path.join(results_dir, 'fpcalc_debug.log')}")
 
     if SHUTDOWN_REQUESTED:
-        print("\n⚠️  Progress saved. Run again to continue."); return
+        print("\n⚠️  Progress saved. Run again to continue.")
+        return
+
+    # Build hash_arrays keyed by content_key for comparison
+    # Only include content_keys that have valid fingerprints
+    hash_arrays = {}  # content_key -> numpy array
+    for content_key, fp_data in fingerprints.items():
+        arr = fp_data.get('fingerprint')
+        if arr is not None and len(arr) > 0:
+            hash_arrays[content_key] = arr
+
+    # Start building results
+    # First: handle byte-for-byte identical files (no comparison needed!)
+    dup_matches_identical = []  # These are 100% certain duplicates
+    
+    for content_key, paths in identical_groups:
+        if content_key not in hash_arrays:
+            continue  # Skip if we don't have a fingerprint
+        # All paths with the same content_key are exact duplicates (100% match)
+        for i in range(len(paths)):
+            for j in range(i+1, len(paths)):
+                path1 = paths[i][0]
+                path2 = paths[j][0]
+                dup_matches_identical.append((path1, path2, 1.0))  # 100% match
+
+    # Get content_keys that need fingerprint comparison
+    # (only keys that appear exactly once in key_to_paths AND have valid fingerprints)
+    content_keys_for_comparison = sorted([
+        ck for ck in hash_arrays.keys() 
+        if len(key_to_paths.get(ck, [])) == 1  # Only compare unique files
+    ])
+    
+    total_pairs = len(content_keys_for_comparison) * (len(content_keys_for_comparison) - 1) // 2
+    
+    print(f"\n📊 Fingerprint comparison:")
+    print(f"   Total fingerprints: {len(hash_arrays)}")
+    print(f"   Byte-identical groups: {len(identical_groups)} (skipping comparison)")
+    print(f"   Unique files to compare: {len(content_keys_for_comparison)}")
+    print(f"   Comparison pairs: {total_pairs:,}")
+
+    # Generate all pairs (using content_keys) for files that aren't already identical
+    all_pairs = [
+        (content_keys_for_comparison[i], content_keys_for_comparison[j]) 
+        if content_keys_for_comparison[i] <= content_keys_for_comparison[j] 
+        else (content_keys_for_comparison[j], content_keys_for_comparison[i])
+        for i in range(len(content_keys_for_comparison)) 
+        for j in range(i+1, len(content_keys_for_comparison))
+    ]
 
     # Phase 2: Cache lookup
-    hash_arrays = {p: fp['fingerprint'] for p, fp in fingerprints.items()
-                   if fp.get('fingerprint') is not None and len(fp['fingerprint']) > 0}
-    paths = sorted(hash_arrays.keys())
-    total_pairs = len(paths) * (len(paths) - 1) // 2
-    print(f"\n📊 Total fingerprints: {len(hash_arrays)}")
-    print(f"   Total pairs: {total_pairs:,}")
-    if len(paths) < 2:
-        print("\nNot enough files to compare."); return
+    dup_matches = list(dup_matches_identical)  # Start with identical file matches
+    clip_matches = []
+    
+    if all_pairs:
+        print(f"\n🔍 Phase 2: Cache lookup...")
+        t0 = time.time()
+        cached_comparisons = cache.get_many_comparisons(all_pairs)
+        print(f"   Found {len(cached_comparisons):,} cached ({time.time()-t0:.1f}s)")
 
-    all_pairs = [_normalize_pair(paths[i], paths[j]) for i in range(len(paths)) for j in range(i+1, len(paths))]
+        pairs_to_compute = [p for p in all_pairs if p not in cached_comparisons]
+        cached_count = len(cached_comparisons)
 
-    print(f"\n🔍 Phase 2: Cache lookup...")
-    t0 = time.time()
-    cached_comparisons = cache.get_many_comparisons(all_pairs)
-    print(f"   Found {len(cached_comparisons):,} cached ({time.time()-t0:.1f}s)")
+        # Process cached comparisons - convert content_key matches to path matches
+        for (k1, k2), (mr, lr, ms) in cached_comparisons.items():
+            is_dup, is_clip = classify_comparison(mr, lr, ms, config)
+            # Get paths for these content_keys (there's exactly one path per key for compared files)
+            paths1 = key_to_paths.get(k1, [])
+            paths2 = key_to_paths.get(k2, [])
+            if paths1 and paths2:
+                p1 = paths1[0][0]
+                p2 = paths2[0][0]
+                if is_dup:
+                    dup_matches.append((p1, p2, mr))
+                elif is_clip:
+                    clip_matches.append((p1, p2, mr))
 
-    pairs_to_compute = [p for p in all_pairs if p not in cached_comparisons]
-    cached_count = len(cached_comparisons)
+        print(f"   Cached: {cached_count:,}, To compute: {len(pairs_to_compute):,}")
+    else:
+        pairs_to_compute = []
+        cached_count = 0
 
-    dup_matches, clip_matches = [], []
-    for (p1, p2), (mr, lr, ms) in cached_comparisons.items():
-        is_dup, is_clip = classify_comparison(mr, lr, ms, config)
-        if is_dup: dup_matches.append((p1, p2, mr))
-        elif is_clip: clip_matches.append((p1, p2, mr))
-
-    print(f"   Cached: {cached_count:,}, To compute: {len(pairs_to_compute):,}")
     if dup_matches or clip_matches:
-        print(f"   From cache: {len(dup_matches)} duplicates, {len(clip_matches)} clips")
+        print(f"   So far: {len(dup_matches)} duplicates, {len(clip_matches)} clips")
 
     # Phase 3: Comparison
     new_comparisons = 0
     if pairs_to_compute and not SHUTDOWN_REQUESTED:
         print(f"\n⚡ Phase 3: Computing {len(pairs_to_compute):,} comparisons ({config.comparison_workers} workers)...")
         print(f"   ⌨️  Press Ctrl+C once to stop gracefully, twice to force quit.")
+        
         _ARRAYS_TEMP_PATH = save_arrays_for_workers(hash_arrays)
         print(f"   Arrays temp file: {os.path.getsize(_ARRAYS_TEMP_PATH)/(1024*1024):.0f} MB")
 
-        batches = [pairs_to_compute[i:i+config.comparison_batch_size] for i in range(0, len(pairs_to_compute), config.comparison_batch_size)]
+        batches = [pairs_to_compute[i:i+config.comparison_batch_size] 
+                   for i in range(0, len(pairs_to_compute), config.comparison_batch_size)]
         pbar = tqdm(total=len(pairs_to_compute), unit="pair")
+        
         try:
-            with ProcessPoolExecutor(max_workers=config.comparison_workers, initializer=init_worker, initargs=(_ARRAYS_TEMP_PATH,)) as executor:
+            with ProcessPoolExecutor(max_workers=config.comparison_workers, 
+                                     initializer=init_worker, initargs=(_ARRAYS_TEMP_PATH,)) as executor:
                 future_to_size = {}
                 for batch in batches:
-                    if SHUTDOWN_REQUESTED: break
+                    if SHUTDOWN_REQUESTED:
+                        break
                     future_to_size[executor.submit(compare_batch, batch, config)] = len(batch)
 
                 batch_buf = []
                 for future in as_completed(future_to_size):
                     if SHUTDOWN_REQUESTED:
-                        for f in future_to_size: f.cancel()
-                        executor.shutdown(wait=False, cancel_futures=True); break
+                        for f in future_to_size:
+                            f.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
                     try:
                         res = future.result()
                         batch_buf.extend(res)
-                        for np1, np2, mr, lr, ms in res:
+                        for k1, k2, mr, lr, ms in res:
                             new_comparisons += 1
                             is_dup, is_clip = classify_comparison(mr, lr, ms, config)
-                            if is_dup:
-                                dup_matches.append((np1, np2, mr))
-                                tqdm.write(f"   ✅ DUP ({mr*100:.1f}%): {os.path.basename(np1)} ↔ {os.path.basename(np2)}")
-                            elif is_clip:
-                                clip_matches.append((np1, np2, mr))
-                                tqdm.write(f"   📎 CLIP ({mr*100:.1f}%): {os.path.basename(np1)} ↔ {os.path.basename(np2)}")
+                            paths1 = key_to_paths.get(k1, [])
+                            paths2 = key_to_paths.get(k2, [])
+                            if paths1 and paths2:
+                                p1 = paths1[0][0]
+                                p2 = paths2[0][0]
+                                if is_dup:
+                                    dup_matches.append((p1, p2, mr))
+                                    tqdm.write(f"   ✅ DUP ({mr*100:.1f}%): {os.path.basename(p1)} ↔ {os.path.basename(p2)}")
+                                elif is_clip:
+                                    clip_matches.append((p1, p2, mr))
+                                    tqdm.write(f"   📎 CLIP ({mr*100:.1f}%): {os.path.basename(p1)} ↔ {os.path.basename(p2)}")
                         pbar.update(future_to_size[future])
                         if len(batch_buf) >= 5000:
-                            cache.batch_set_comparisons(batch_buf); batch_buf = []
+                            cache.batch_set_comparisons(batch_buf)
+                            batch_buf = []
                     except Exception as e:
                         tqdm.write(f"   ⚠️  Batch error: {type(e).__name__}: {str(e)[:80]}")
                         pbar.update(future_to_size[future])
-                if batch_buf: cache.batch_set_comparisons(batch_buf)
+                
+                if batch_buf:
+                    cache.batch_set_comparisons(batch_buf)
             pbar.close()
             cache.wal_checkpoint()
         finally:
             cleanup_arrays_file()
 
     if SHUTDOWN_REQUESTED:
-        print("\n⚠️  Progress saved. Run again to continue."); return
+        print("\n⚠️  Progress saved. Run again to continue.")
+        return
 
     print(f"\n✓ {len(dup_matches)+len(clip_matches)} matches ({len(dup_matches)} dups, {len(clip_matches)} clips)")
-    print(f"   ({cached_count:,} cached, {new_comparisons:,} computed)")
+    if len(dup_matches_identical) > 0:
+        print(f"   ({len(dup_matches_identical)} byte-identical, {cached_count:,} cached, {new_comparisons:,} computed)")
+    else:
+        print(f"   ({cached_count:,} cached, {new_comparisons:,} computed)")
 
     # Phase 4: Safe grouping
     print("\n📋 Phase 4: Grouping results...")
+    
+    # Build path-based fingerprints dict for reporting
+    # Map each path to its fingerprint data (via content_key)
+    path_fingerprints = {}
+    for content_key, paths in key_to_paths.items():
+        fp_data = fingerprints.get(content_key)
+        if fp_data:
+            for path, size, mtime in paths:
+                path_fingerprints[path] = {
+                    'content_key': content_key,
+                    'file_size': size,
+                    'duration': fp_data.get('duration', 0),
+                }
+    
+    # Union-Find for exact duplicates only
     uf = UnionFind()
-    for p1, p2, _ in dup_matches: uf.union(p1, p2)
+    for p1, p2, _ in dup_matches:
+        uf.union(p1, p2)
 
+    # Get all paths that have fingerprints
+    all_paths = list(path_fingerprints.keys())
+    
     dup_groups_raw = defaultdict(list)
-    for path in paths: uf.find(path); dup_groups_raw[uf.find(path)].append(path)
+    for path in all_paths:
+        uf.find(path)
+        dup_groups_raw[uf.find(path)].append(path)
 
     dup_groups, keep_set, dup_delete_set = [], set(), set()
     for gp in dup_groups_raw.values():
-        if len(gp) < 2: keep_set.add(gp[0]); continue
-        sg = sorted(gp, key=lambda p: (fingerprints[p]['file_size'], fingerprints[p].get('duration',0)), reverse=True)
-        keep_set.add(sg[0]); dup_delete_set.update(sg[1:])
-        sizes = [fingerprints[p]['file_size'] for p in sg]
+        if len(gp) < 2:
+            keep_set.add(gp[0])
+            continue
+        sg = sorted(gp, key=lambda p: (
+            path_fingerprints[p]['file_size'], 
+            path_fingerprints[p].get('duration', 0)
+        ), reverse=True)
+        keep_set.add(sg[0])
+        dup_delete_set.update(sg[1:])
+        sizes = [path_fingerprints[p]['file_size'] for p in sg]
+        
+        # Check if this group is byte-for-byte identical
+        # (all paths have the same content_key)
+        content_keys_in_group = set(path_fingerprints[p]['content_key'] for p in sg)
+        is_identical = len(content_keys_in_group) == 1
+        
         dup_groups.append({
-            'recommend_keep': sg[0], 'recommend_delete': sg[1:],
-            'potential_savings': sum(fingerprints[p]['file_size'] for p in sg[1:]),
-            'size_warning': (max(sizes) / max(min(sizes), 1)) > 3.0,
-            'videos': [{'path': p, 'size': fingerprints[p]['file_size'], 'duration': fingerprints[p].get('duration',0)} for p in sg],
+            'recommend_keep': sg[0],
+            'recommend_delete': sg[1:],
+            'potential_savings': sum(path_fingerprints[p]['file_size'] for p in sg[1:]),
+            'size_warning': (max(sizes) / max(min(sizes), 1)) > 3.0 if not is_identical else False,
+            'identical': is_identical,
+            'videos': [
+                {
+                    'path': p, 
+                    'size': path_fingerprints[p]['file_size'], 
+                    'duration': path_fingerprints[p].get('duration', 0)
+                } 
+                for p in sg
+            ],
         })
     dup_groups.sort(key=lambda g: g['potential_savings'], reverse=True)
 
+    # Clip relationships
     clip_children = defaultdict(list)
     for p1, p2, mr in clip_matches:
-        l1 = len(hash_arrays[p1]) if p1 in hash_arrays else 0
-        l2 = len(hash_arrays[p2]) if p2 in hash_arrays else 0
+        # Determine parent/child by fingerprint length
+        ck1 = path_fingerprints.get(p1, {}).get('content_key')
+        ck2 = path_fingerprints.get(p2, {}).get('content_key')
+        l1 = len(hash_arrays.get(ck1, [])) if ck1 else 0
+        l2 = len(hash_arrays.get(ck2, [])) if ck2 else 0
         child, parent = (p1, p2) if l1 <= l2 else (p2, p1)
         clip_children[child].append((parent, mr))
 
     clip_deletions = []
     for child, parents in clip_children.items():
-        if child in dup_delete_set: continue
-        if child in keep_set and any(child == g['recommend_keep'] for g in dup_groups): continue
+        if child in dup_delete_set:
+            continue
+        if child in keep_set and any(child == g['recommend_keep'] for g in dup_groups):
+            continue
         kept = [(par, r) for par, r in parents if par in keep_set]
         if kept:
-            clip_deletions.append((child, [p for p,_ in kept], max(r for _,r in kept)))
-    clip_deletions.sort(key=lambda x: fingerprints[x[0]]['file_size'], reverse=True)
+            clip_deletions.append((child, [p for p, _ in kept], max(r for _, r in kept)))
+    clip_deletions.sort(key=lambda x: path_fingerprints[x[0]]['file_size'], reverse=True)
 
     # Output
     display_root = root_dirs[0]
@@ -1374,64 +1922,108 @@ def main():
     print("   music will match. Review results before deleting.")
 
     if not dup_groups and not clip_deletions:
-        print("\n✨ No duplicates or clips found!"); return
+        print("\n✨ No duplicates or clips found!")
+        return
 
     if dup_groups:
+        identical_count = sum(1 for g in dup_groups if g.get('identical'))
         print(f"\n📋 EXACT DUPLICATES: {len(dup_groups)} groups")
+        if identical_count:
+            print(f"   ({identical_count} groups are byte-for-byte identical files)")
         print(f"   Delete: {sum(len(g['recommend_delete']) for g in dup_groups)} files")
         print(f"   Savings: {format_size(sum(g['potential_savings'] for g in dup_groups))}")
         for i, g in enumerate(dup_groups[:15], 1):
             warn = " ⚠️ SIZE MISMATCH" if g.get('size_warning') else ""
+            ident = " 🔥 IDENTICAL" if g.get('identical') else ""
             print(f"\n{'─'*50}")
-            print(f"Dup Group {i} ({len(g['videos'])} files, save {format_size(g['potential_savings'])}){warn}")
+            print(f"Dup Group {i} ({len(g['videos'])} files, save {format_size(g['potential_savings'])}){ident}{warn}")
             if g.get('size_warning'):
                 print(f"   ⚠️  Files differ >3x in size — likely shared audio!")
+            if g.get('identical'):
+                print(f"   🔥  Byte-for-byte identical copies!")
             for v in g['videos']:
                 marker = "✓ KEEP  " if v['path'] == g['recommend_keep'] else "✗ DELETE"
                 print(f"   {marker} {os.path.relpath(v['path'], display_root)}")
                 print(f"            {format_size(v['size'])}, {format_duration(v['duration']) if v['duration'] else '?'}")
-        if len(dup_groups) > 15: print(f"\n   ... and {len(dup_groups)-15} more groups")
+        if len(dup_groups) > 15:
+            print(f"\n   ... and {len(dup_groups)-15} more groups")
 
     if clip_deletions:
-        clip_savings = sum(fingerprints[c]['file_size'] for c,_,_ in clip_deletions)
+        clip_savings = sum(path_fingerprints[c]['file_size'] for c, _, _ in clip_deletions)
         print(f"\n📎 REDUNDANT CLIPS: {len(clip_deletions)} files, {format_size(clip_savings)}")
         for i, (child, parents, ratio) in enumerate(clip_deletions[:15], 1):
             pnames = ", ".join(os.path.basename(p) for p in parents[:3])
-            if len(parents) > 3: pnames += f" (+{len(parents)-3})"
+            if len(parents) > 3:
+                pnames += f" (+{len(parents)-3})"
             print(f"\n{'─'*50}")
             print(f"Clip {i} ({ratio*100:.0f}% match)")
             print(f"   ✗ DELETE  {os.path.relpath(child, display_root)}")
-            print(f"             {format_size(fingerprints[child]['file_size'])}, {format_duration(fingerprints[child].get('duration',0))}")
+            print(f"             {format_size(path_fingerprints[child]['file_size'])}, {format_duration(path_fingerprints[child].get('duration', 0))}")
             print(f"   ↳ Contained in: {pnames}")
-        if len(clip_deletions) > 15: print(f"\n   ... and {len(clip_deletions)-15} more clips")
+        if len(clip_deletions) > 15:
+            print(f"\n   ... and {len(clip_deletions)-15} more clips")
 
     # Save results
     os.makedirs(results_dir, exist_ok=True)
     total_delete = sum(len(g['recommend_delete']) for g in dup_groups) + len(clip_deletions)
-    total_savings = sum(g['potential_savings'] for g in dup_groups) + sum(fingerprints[c]['file_size'] for c,_,_ in clip_deletions)
+    total_savings = (
+        sum(g['potential_savings'] for g in dup_groups) + 
+        sum(path_fingerprints[c]['file_size'] for c, _, _ in clip_deletions)
+    )
 
-    # JSON
+    # JSON report
     report = {
-        'scan_info': {'directories': root_dirs, 'total_files': len(media_files), 'fingerprinted': len(fingerprints),
-                      'failed': cache.get_failed_count(), 'scan_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                      'config': {k: getattr(config, k) for k in ['clip_match_ratio','duplicate_match_ratio','intro_filter_seconds','match_threshold','chunk_size']}},
-        'summary': {'duplicate_groups': len(dup_groups), 'redundant_clips': len(clip_deletions),
-                    'files_to_delete': total_delete, 'potential_savings': format_size(total_savings)},
-        'duplicate_groups': [{'group_id': i, 'file_count': len(g['videos']), 'potential_savings': format_size(g['potential_savings']),
-            'size_warning': g.get('size_warning', False), 'recommend_keep': os.path.relpath(g['recommend_keep'], display_root),
-            'recommend_delete': [os.path.relpath(p, display_root) for p in g['recommend_delete']],
-            'files': [{'path': os.path.relpath(v['path'], display_root), 'size': format_size(v['size']),
-                       'duration': format_duration(v['duration']) if v['duration'] else '?',
-                       'action': 'KEEP' if v['path']==g['recommend_keep'] else 'DELETE'} for v in g['videos']]}
-            for i, g in enumerate(dup_groups, 1)],
-        'redundant_clips': [{'clip': os.path.relpath(c, display_root), 'clip_size': format_size(fingerprints[c]['file_size']),
-            'clip_duration': format_duration(fingerprints[c].get('duration',0)), 'match_ratio': f"{r*100:.1f}%",
-            'contained_in': [os.path.relpath(p, display_root) for p in ps]} for c, ps, r in clip_deletions],
+        'scan_info': {
+            'directories': root_dirs, 
+            'total_files': len(media_files), 
+            'fingerprinted': len(path_fingerprints),
+            'failed': cache.get_failed_count(), 
+            'scan_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'config': {k: getattr(config, k) for k in ['clip_match_ratio', 'duplicate_match_ratio', 'intro_filter_seconds', 'match_threshold', 'chunk_size']}
+        },
+        'summary': {
+            'duplicate_groups': len(dup_groups), 
+            'identical_groups': sum(1 for g in dup_groups if g.get('identical')),
+            'redundant_clips': len(clip_deletions),
+            'files_to_delete': total_delete, 
+            'potential_savings': format_size(total_savings)
+        },
+        'duplicate_groups': [
+            {
+                'group_id': i, 
+                'file_count': len(g['videos']), 
+                'potential_savings': format_size(g['potential_savings']),
+                'size_warning': g.get('size_warning', False),
+                'identical': g.get('identical', False),
+                'recommend_keep': os.path.relpath(g['recommend_keep'], display_root),
+                'recommend_delete': [os.path.relpath(p, display_root) for p in g['recommend_delete']],
+                'files': [
+                    {
+                        'path': os.path.relpath(v['path'], display_root), 
+                        'size': format_size(v['size']),
+                        'duration': format_duration(v['duration']) if v['duration'] else '?',
+                        'action': 'KEEP' if v['path'] == g['recommend_keep'] else 'DELETE'
+                    } 
+                    for v in g['videos']
+                ]
+            }
+            for i, g in enumerate(dup_groups, 1)
+        ],
+        'redundant_clips': [
+            {
+                'clip': os.path.relpath(c, display_root), 
+                'clip_size': format_size(path_fingerprints[c]['file_size']),
+                'clip_duration': format_duration(path_fingerprints[c].get('duration', 0)), 
+                'match_ratio': f"{r*100:.1f}%",
+                'contained_in': [os.path.relpath(p, display_root) for p in ps]
+            } 
+            for c, ps, r in clip_deletions
+        ],
     }
     with open(os.path.join(results_dir, 'duplicate_report.json'), 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    # .bat
+    # .bat file
     with open(os.path.join(results_dir, 'delete_duplicates.bat'), 'w', encoding='utf-8') as f:
         f.write('@echo off\nchcp 65001 > nul\n')
         f.write(f'REM {total_delete} files, {format_size(total_savings)} potential savings\n')
@@ -1440,17 +2032,19 @@ def main():
             f.write(f'REM Keep: {os.path.relpath(g["recommend_keep"], display_root)}\n')
             if g.get('size_warning'):
                 f.write('REM SIZE MISMATCH — uncomment only if verified:\n')
-                for p in g['recommend_delete']: f.write(f'REM del "{_bat_safe_path(p)}"\n')
+                for p in g['recommend_delete']:
+                    f.write(f'REM del "{_bat_safe_path(p)}"\n')
             else:
-                for p in g['recommend_delete']: f.write(f'del "{_bat_safe_path(p)}"\n')
+                for p in g['recommend_delete']:
+                    f.write(f'del "{_bat_safe_path(p)}"\n')
             f.write('\n')
         for child, parents, ratio in clip_deletions:
             f.write(f'REM Clip ({ratio*100:.0f}%% match) of {os.path.basename(parents[0])}\n')
             f.write(f'del "{_bat_safe_path(child)}"\n\n')
         f.write('echo Done!\npause\n')
 
-    # .ps1
-    with open(os.path.join(results_dir, 'delete_duplicates.ps1'), 'w', encoding='utf-8') as f:
+    # .ps1 file — MUST use utf-8-sig (BOM) so PowerShell correctly reads Unicode paths
+    with open(os.path.join(results_dir, 'delete_duplicates.ps1'), 'w', encoding='utf-8-sig') as f:
         f.write(f'# {total_delete} files, {format_size(total_savings)} savings\n')
         f.write('# Run: powershell -ExecutionPolicy Bypass -File delete_duplicates.ps1\n')
         f.write('Write-Host "WARNING: This will PERMANENTLY delete files!" -ForegroundColor Red\n')
@@ -1469,14 +2063,25 @@ def main():
             f.write(f"Remove-Item -LiteralPath '{os.path.abspath(child).replace(chr(39), chr(39)+chr(39))}' -Force\n\n")
         f.write('Write-Host "Done!" -ForegroundColor Green\n')
 
+    # PowerShell launcher — bypasses ExecutionPolicy without requiring system changes
+    with open(os.path.join(results_dir, 'RUN_DELETIONS.bat'), 'w', encoding='utf-8') as f:
+        f.write('@echo off\n')
+        f.write('chcp 65001 > nul\n')
+        f.write('echo This will run the PowerShell deletion script.\n')
+        f.write('echo If you see a red "scripts disabled" error, use this launcher instead.\n')
+        f.write('pause\n')
+        f.write('PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0delete_duplicates.ps1"\n')
+        f.write('pause\n')
+
     # Interactive HTML report
-    _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints, display_root, total_delete, total_savings)
+    _generate_html_report(results_dir, dup_groups, clip_deletions, path_fingerprints, display_root, total_delete, total_savings)
 
     print(f"\n📄 Results saved to: {results_dir}")
     print("   - review_results.html     (interactive — open in browser)")
     print("   - duplicate_report.json")
     print("   - delete_duplicates.bat   (cmd.exe)")
     print("   - delete_duplicates.ps1   (PowerShell — handles long paths)")
+    print("   - RUN_DELETIONS.bat       (launches PowerShell with bypass)")
     if _debug_logger and _debug_logger.handlers:
         print("   - fpcalc_debug.log        (anonymized failure details)")
     print(f"\n   Total: {total_delete} files, {format_size(total_savings)} savings")

@@ -12,24 +12,6 @@ It finds two things:
 
 ---
 
-## What's New in v28
-
-**🔑 Content-Based Cache Keys** — The cache now survives file moves and renames!
-
-Previous versions used file paths as cache keys, which meant moving a file to a different folder triggered a full re-extraction. v28 uses a **content-based key** derived from:
-- First 64KB of the file
-- Last 64KB of the file  
-- Total file size
-
-This means:
-- **Reorganize your library** without losing cache data
-- **Rename files** without re-extracting fingerprints
-- **Move files between drives** and comparisons stay cached
-
-The new cache file is `.audio_cache_v1b.db` (schema version v1b). Your old v1a cache is not migrated — you'll need to re-extract on first run, but after that it's permanent regardless of file organization.
-
----
-
 ## Quick Start
 
 ```bash
@@ -64,9 +46,9 @@ Output:              HTML report + .bat + .ps1 + .json
 
 **Fingerprints** are arrays of 32-bit integers (~6 per second of audio). Comparing two files means sliding the shorter array across the longer one, XOR-ing chunks, and counting differing bits. A low hamming distance = matching audio.
 
-**Content-Based Caching** (v28+) stores fingerprints and comparisons keyed by a hash of the file's content (first+last 64KB + size), not by path. This means you can rename or move files and the cache still applies.
+**Content-Based Caching** stores fingerprints and comparisons keyed by a hash of the file's content (first+last 64KB + size), not by path. This means you can rename or move files and the cache still applies.
 
-**Caching** stores raw comparison metrics (match_ratio, length_ratio, matched_seconds) — not boolean results. This means you can change `--clip-ratio` or `--dup-ratio` between runs and cached metrics are re-evaluated against the new thresholds instantly, without re-extracting or re-comparing.
+**Threshold Re-evaluation** stores raw comparison metrics (match_ratio, length_ratio, matched_seconds) — not boolean results. This means you can change `--clip-ratio` or `--dup-ratio` between runs and cached metrics are re-evaluated against the new thresholds instantly, without re-extracting or re-comparing.
 
 ---
 
@@ -89,12 +71,18 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 
 ```
 📂 results_Movies_TV_20260320_143022/
-├── review_results.html      ← Interactive — open in browser
-├── duplicate_report.json     Full structured data
-├── delete_duplicates.bat     cmd.exe (260 char path limit)
-├── delete_duplicates.ps1     PowerShell (handles long paths)
-└── fpcalc_debug.log          Anonymized failure log (no filenames)
+├── review_results.html       ← Interactive — open in browser
+├── duplicate_report.json      Full structured data
+├── delete_duplicates.bat      cmd.exe script (basic)
+├── delete_duplicates.ps1      PowerShell script (handles long paths + Unicode)
+├── RUN_DELETIONS.bat          Launches PowerShell with ExecutionPolicy bypass
+└── fpcalc_debug.log           Anonymized failure log (if errors occurred)
 ```
+
+**Which script should I use?**
+- **RUN_DELETIONS.bat** — Recommended. Double-click this to run the PowerShell script without needing to change system settings.
+- **delete_duplicates.ps1** — The actual deletion script. Use directly if you've already enabled PowerShell scripts.
+- **delete_duplicates.bat** — Fallback for cmd.exe. Has 260-character path limit on older Windows.
 
 ---
 
@@ -142,14 +130,12 @@ python VidClipDupli.py "D:\Videos" --intro-filter 0
 - **Python 3.8+**
 - **numpy**, **tqdm** (`pip install numpy tqdm`)
 - **fpcalc.exe** from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) — place in the script directory
-- **Windows 10/11** (uses Windows-specific subprocess flags and 8.3 short path API)
+- **Windows 10/11** (uses Windows-specific subprocess flags and short path API)
 - Works on any CPU (Intel, AMD, ARM). No GPU needed.
 
 ---
 
-## Cache Details (v28+)
-
-### Schema v1b — Content-Based Keys
+## Cache Details
 
 The cache uses content-based keys (`quick_hash`) instead of file paths:
 
@@ -157,21 +143,17 @@ The cache uses content-based keys (`quick_hash`) instead of file paths:
 quick_hash = MD5(first_64KB + last_64KB + file_size)[:16]
 ```
 
-**Fingerprints table:**
-- `content_key` (PRIMARY KEY) — the quick_hash
-- `current_path` — most recently seen path (for display)
-- `file_size`, `fingerprint`, `duration`
-
-**Comparisons table:**
-- `key1`, `key2` (PRIMARY KEY) — normalized pair of content_keys
-- `match_ratio`, `length_ratio`, `matched_seconds`
-
 **Benefits:**
 - Move files → cache still works
 - Rename files → cache still works
 - Reorganize library → no re-extraction needed
 
-**Cache file:** `.audio_cache_v1b.db` in the script directory
+**Cache file:** `.audio_cache.db` in the script directory
+
+**Schema:**
+- `fingerprints` — content_key (PRIMARY KEY), current_path, file_size, fingerprint, duration
+- `comparisons` — key1, key2 (PRIMARY KEY), match_ratio, length_ratio, matched_seconds
+- `failed_files` — content_key (PRIMARY KEY), last_path, reason
 
 ---
 
@@ -192,7 +174,7 @@ Best for: movies, TV episodes, music, lectures, podcasts. Use caution with TikTo
 
 | Component | Spec | Notes |
 |---|---|---|
-| CPU | Intel 13700K (24 cores) | 18 comparison workers (75%) |
+| CPU | Intel 13700K (24 threads) | 18 comparison workers (75%) |
 | RAM | 64 GB DDR5 | ~500 MB fingerprint data for 3000 files |
 | Storage | 4.44 TB NAS via Gigabit Ethernet | 4-6 extraction workers saturates link |
 | GPU | Intel Arc A770 | Not used — audio fingerprinting is CPU-only |
@@ -207,32 +189,17 @@ Minimum: 4-core CPU, 8 GB RAM. Reduce `-w` and `-c` for slower hardware.
 |---|---|---|
 | `fpcalc.exe not found` | Missing binary | Download from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) |
 | Mass `exit code 1` with empty stderr | Timeout on large files over NAS | `--clear-failed --timeout 900` |
-| `.ts` files failing | Brackets `[]` in filename | v27+ safe-path fallback handles this |
-| `database is locked` | Another instance running | Close it, retry |
+| `.ts` files failing | Brackets `[]` in filename | Safe-path fallback handles this automatically |
+| `Another instance is already running` | Multiple VCD processes | Close other instance, or wait for it to finish |
+| `database is locked` | Stale lock file after crash | Delete `.vcd_instance.lock` in script directory |
+| PowerShell "scripts disabled" error | Execution policy blocking | Use `RUN_DELETIONS.bat` instead |
 | False positives (shared music) | Audio-only limitation | Size-warning flag auto-comments these in scripts |
 | Stuck at Phase 3 start | Serializing arrays to temp file | Normal for large libraries, wait ~10s |
 | Stuck at "Computing content keys" | NAS latency on many files | Normal — reads 128KB per file |
-
----
-
-## Migration from v27 (v1a cache)
-
-v28 uses a new cache schema (v1b) that is not compatible with v27's path-based cache. On first run:
-
-1. The old `.audio_cache_v1a.db` is **not deleted** — you can keep it as backup
-2. A new `.audio_cache_v1b.db` is created
-3. All fingerprints need to be re-extracted (one-time cost)
-4. After that, the cache survives all file moves/renames
-
-If you want to delete the old cache manually:
-```bash
-del .audio_cache_v1a.db
-del .audio_cache_v1a.db-shm
-del .audio_cache_v1a.db-wal
-```
+| Long paths failing (>260 chars) | Deep NAS folder structure | Handled automatically via Windows extended-length paths |
 
 ---
 
 ## License
 
-MIT
+AGPL-3.0 — See [LICENSE](LICENSE) for details.
