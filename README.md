@@ -30,6 +30,10 @@ No arguments needed — the interactive setup walks you through everything: fold
 python VidClipDupli.py "Z:\Movies" "Z:\TV Shows" "Z:\Clips" --no-prompt
 ```
 
+### Optional: ffmpeg for better container support
+
+Place `ffmpeg.exe` next to the script (or ensure it's on your PATH). When fpcalc fails on MPEG-PS/TS containers (`.mpg`, `.vob`, `.ts`, `.mpeg`, `.m2ts`, `.mts`), VCD will automatically extract audio with ffmpeg and retry. Download from [ffmpeg.org](https://ffmpeg.org/download.html).
+
 ---
 
 ## How It Works
@@ -37,7 +41,8 @@ python VidClipDupli.py "Z:\Movies" "Z:\TV Shows" "Z:\Clips" --no-prompt
 ```
 Phase 0: Scan        Find all media files in target directories
 Phase 0.5: Hash      Compute content keys (quick_hash) for cache lookup
-Phase 1: Extract     fpcalc decodes the full audio stream of every file → uint32 fingerprint array
+Phase 1: Extract     fpcalc decodes the full audio stream → uint32 fingerprint array
+                     (ffmpeg fallback for MPEG-PS/TS containers if available)
 Phase 2: Cache       Look up previously computed comparisons in SQLite
 Phase 3: Compare     Sliding-window XOR + popcount across all pairs (multi-core)
 Phase 4: Group       Union-Find for duplicates, directed edges for clips
@@ -46,9 +51,11 @@ Output:              HTML report + .bat + .ps1 + .json
 
 **Fingerprints** are arrays of 32-bit integers (~6 per second of audio). Comparing two files means sliding the shorter array across the longer one, XOR-ing chunks, and counting differing bits. A low hamming distance = matching audio.
 
-**Content-Based Caching** stores fingerprints and comparisons keyed by a hash of the file's content (first+last 64KB + size), not by path. This means you can rename or move files and the cache still applies.
+**Content-Based Caching** stores fingerprints and comparisons keyed by a hash of the file's content (first + middle + last 64KB + size), not by path. This means you can rename or move files and the cache still applies.
 
-**Threshold Re-evaluation** stores raw comparison metrics (match_ratio, length_ratio, matched_seconds) — not boolean results. This means you can change `--clip-ratio` or `--dup-ratio` between runs and cached metrics are re-evaluated against the new thresholds instantly, without re-extracting or re-comparing.
+**Byte-for-byte detection** — Files with identical content keys are grouped as exact duplicates instantly, without needing fingerprint comparison. This catches copies across different folders in milliseconds.
+
+**Threshold Re-evaluation** stores raw comparison metrics (match_ratio, length_ratio, matched_seconds) — not boolean results. You can change `--clip-ratio` or `--dup-ratio` between runs and cached metrics are re-evaluated against the new thresholds instantly, without re-extracting or re-comparing.
 
 ---
 
@@ -57,13 +64,19 @@ Output:              HTML report + .bat + .ps1 + .json
 The star feature. Open `review_results.html` in any browser:
 
 - Each duplicate group is a card showing every file with size, duration, and full path
+- **Clickable filenames** open the file directly; **clickable folder paths** open the containing directory
+- **Open** button for quick preview of any file
 - **Keep** / **Delete** / **Use Name** buttons on every file
-- "Use Name" keeps the higher-quality file but renames it to the other file's name
+- "Use Name" shows an **editable text field** — type any custom filename
+- **Folder selector** appears when files are in different directories — choose where the renamed file goes
 - **Skip** button to leave a group untouched
 - Live counters for deletions, renames, and skips
+- Redundant clips shown as parent/child pairs with the same interactive controls
 - Big **Download Custom PowerShell Script** button at the bottom
 
-The generated `.ps1` contains only the actions you chose — `Remove-Item` for deletions, `Rename-Item` for renames. No surprises.
+The generated `.ps1` contains only the actions you chose — `Remove-Item` for deletions, `Rename-Item` for same-directory renames, `Move-Item` for cross-directory moves. No surprises.
+
+> **Note:** The static `RUN_DELETIONS.bat` in the results folder uses the default recommendations. For your custom choices, use the downloaded script from the HTML report.
 
 ---
 
@@ -80,8 +93,9 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 ```
 
 **Which script should I use?**
-- **RUN_DELETIONS.bat** — Recommended. Double-click this to run the PowerShell script without needing to change system settings.
-- **delete_duplicates.ps1** — The actual deletion script. Use directly if you've already enabled PowerShell scripts.
+- **review_results.html** — Recommended. Review interactively, then download a custom PowerShell script with your exact choices.
+- **RUN_DELETIONS.bat** — Quick option. Double-click to run the default deletion recommendations without interactive review.
+- **delete_duplicates.ps1** — The default deletion script. Use directly if you've already enabled PowerShell scripts.
 - **delete_duplicates.bat** — Fallback for cmd.exe. Has 260-character path limit on older Windows.
 
 ---
@@ -110,6 +124,9 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 # Scan multiple NAS shares
 python VidClipDupli.py "\\NAS\Movies" "\\NAS\TV" "\\NAS\Clips"
 
+# Scan local drive + NAS together (cross-drive is supported)
+python VidClipDupli.py "C:\Clips" "Z:\Movies"
+
 # Retry failed files with a higher timeout
 python VidClipDupli.py "Z:\Videos" --clear-failed --timeout 900
 
@@ -131,6 +148,7 @@ python VidClipDupli.py "D:\Videos" --intro-filter 0
 - **numpy**, **tqdm** (`pip install numpy tqdm`)
 - **fpcalc.exe** from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) — place in the script directory
 - **Windows 10/11** (uses Windows-specific subprocess flags and short path API)
+- **ffmpeg** (optional) — enables fallback for `.mpg`, `.vob`, `.ts` files that fpcalc can't handle
 - Works on any CPU (Intel, AMD, ARM). No GPU needed.
 
 ---
@@ -140,8 +158,10 @@ python VidClipDupli.py "D:\Videos" --intro-filter 0
 The cache uses content-based keys (`quick_hash`) instead of file paths:
 
 ```
-quick_hash = MD5(first_64KB + last_64KB + file_size)[:16]
+quick_hash = MD5(first_64KB + middle_64KB + last_64KB + file_size)[:16]
 ```
+
+The three-point sampling (start, middle, end) prevents collisions between same-size CBR files from dashcams, GoPros, and security cameras, while keeping reads to just 192KB per file.
 
 **Benefits:**
 - Move files → cache still works
@@ -154,6 +174,21 @@ quick_hash = MD5(first_64KB + last_64KB + file_size)[:16]
 - `fingerprints` — content_key (PRIMARY KEY), current_path, file_size, fingerprint, duration
 - `comparisons` — key1, key2 (PRIMARY KEY), match_ratio, length_ratio, matched_seconds
 - `failed_files` — content_key (PRIMARY KEY), last_path, reason
+- `cache_params` — tracks algorithm version; auto-clears stale data on upgrades
+
+---
+
+## Unicode & Special Characters
+
+VCD handles filenames with Chinese, Japanese, Korean, emoji, brackets, and other special characters through a multi-step fallback chain:
+
+1. **8.3 short path** — Converts to DOS-safe `FILENA~1.MKV` via Windows API
+2. **Hardlink** — Creates a safe-named hardlink in the same directory (zero-copy)
+3. **Symlink (same dir)** — If hardlink fails, tries a symlink (requires Developer Mode)
+4. **Symlink (temp dir)** — If NAS is read-only, creates symlink in `%TEMP%` pointing to the NAS file (zero network I/O)
+5. **Raw path** — If all else fail, passes the original path to fpcalc
+
+No files are ever copied. The entire chain is zero-copy.
 
 ---
 
@@ -163,8 +198,9 @@ quick_hash = MD5(first_64KB + last_64KB + file_size)[:16]
 |---|---|---|
 | **Audio-only matching** | Different videos with the same background music will match | Groups with >3x file size difference are auto-flagged |
 | **Full audio decode** | First run on 3000+ files over Gigabit NAS takes 15-30 hours | Cached — subsequent runs are near-instant |
-| **Content-based cache** | Editing a file (even just metadata) may trigger re-extraction | Only if first/last 64KB or size changes |
+| **Content-based cache** | Editing a file (even just metadata) may trigger re-extraction | Only if first/middle/last 64KB or size changes |
 | **Time-agnostic matching** | Compilations with scattered fragments may hit clip threshold | Review clip results before deleting |
+| **MPEG-PS/TS containers** | fpcalc may fail on `.mpg`, `.vob`, `.ts` with certain codecs | Install ffmpeg for automatic fallback |
 
 Best for: movies, TV episodes, music, lectures, podcasts. Use caution with TikTok/meme folders or stock footage libraries where many videos share the same background music.
 
@@ -179,7 +215,7 @@ Best for: movies, TV episodes, music, lectures, podcasts. Use caution with TikTo
 | Storage | 4.44 TB NAS via Gigabit Ethernet | 4-6 extraction workers saturates link |
 | GPU | Intel Arc A770 | Not used — audio fingerprinting is CPU-only |
 
-Minimum: 4-core CPU, 8 GB RAM. Reduce `-w` and `-c` for slower hardware.
+Minimum: 2-core CPU, 8 GB RAM. Worker counts auto-scale to your hardware.
 
 ---
 
@@ -189,14 +225,16 @@ Minimum: 4-core CPU, 8 GB RAM. Reduce `-w` and `-c` for slower hardware.
 |---|---|---|
 | `fpcalc.exe not found` | Missing binary | Download from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) |
 | Mass `exit code 1` with empty stderr | Timeout on large files over NAS | `--clear-failed --timeout 900` |
-| `.ts` files failing | Brackets `[]` in filename | Safe-path fallback handles this automatically |
+| `.mpg`/`.vob`/`.ts` files failing | Container not supported by fpcalc | Install ffmpeg for automatic fallback |
+| `.ts` files failing with brackets in name | Brackets `[]` in filename | Safe-path fallback handles this automatically |
 | `Another instance is already running` | Multiple VCD processes | Close other instance, or wait for it to finish |
 | `database is locked` | Stale lock file after crash | Delete `.vcd_instance.lock` in script directory |
 | PowerShell "scripts disabled" error | Execution policy blocking | Use `RUN_DELETIONS.bat` instead |
 | False positives (shared music) | Audio-only limitation | Size-warning flag auto-comments these in scripts |
 | Stuck at Phase 3 start | Serializing arrays to temp file | Normal for large libraries, wait ~10s |
-| Stuck at "Computing content keys" | NAS latency on many files | Normal — reads 128KB per file |
+| Stuck at "Computing content keys" | NAS latency on many files | Normal — reads 192KB per file |
 | Long paths failing (>260 chars) | Deep NAS folder structure | Handled automatically via Windows extended-length paths |
+| UNC paths not opening from HTML | Browser security restriction | Works in Chrome/Edge; some browsers block `file://` URLs |
 
 ---
 

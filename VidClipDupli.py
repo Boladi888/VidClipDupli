@@ -42,7 +42,7 @@ import atexit
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import multiprocessing
 
@@ -60,11 +60,24 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 FPCALC_PATH = os.path.join(_BASE_DIR, 'fpcalc.exe')
+FFMPEG_PATH: Optional[str] = None  # Detected at startup if available
 GLOBAL_ARRAYS: Dict[str, np.ndarray] = {}
 FPCALC_MAX_STDOUT_BYTES = 50 * 1024 * 1024
 _ARRAYS_TEMP_PATH: Optional[str] = None
 _debug_logger: Optional[logging.Logger] = None
 _INSTANCE_LOCK_FD: Optional[int] = None
+
+# Containers that fpcalc often fails on — ffmpeg fallback will pre-extract audio
+_FFMPEG_FALLBACK_EXTENSIONS = {'.mpg', '.vob', '.ts', '.mpeg', '.m2ts', '.mts'}
+
+def _find_ffmpeg() -> Optional[str]:
+    """Find ffmpeg.exe — check script directory first, then PATH."""
+    local = os.path.join(_BASE_DIR, 'ffmpeg.exe')
+    if os.path.exists(local):
+        return local
+    import shutil
+    found = shutil.which('ffmpeg')
+    return found
 
 def acquire_instance_lock() -> bool:
     """
@@ -96,6 +109,29 @@ def acquire_instance_lock() -> bool:
                 pass
             _INSTANCE_LOCK_FD = None
         return False
+
+def release_instance_lock():
+    """Release the instance lock so another run can start cleanly.
+    Explicitly unlocks before closing to avoid undefined msvcrt behavior."""
+    global _INSTANCE_LOCK_FD
+    if _INSTANCE_LOCK_FD is not None:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(_INSTANCE_LOCK_FD, msvcrt.LK_UNLCK, 1)
+            os.close(_INSTANCE_LOCK_FD)
+        except OSError:
+            pass
+        _INSTANCE_LOCK_FD = None
+        # Clean up the physical lockfile
+        try:
+            lock_path = os.path.join(_BASE_DIR, '.vcd_instance.lock')
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
+
+atexit.register(release_instance_lock)
 
 def setup_debug_logger(results_dir: str) -> logging.Logger:
     """Create anonymized debug log for fpcalc failures."""
@@ -139,8 +175,16 @@ def save_arrays_for_workers(hash_arrays: Dict[str, np.ndarray]) -> str:
         return f.name
 
 def cleanup_arrays_file():
-    """Remove the temp arrays file. Registered with atexit for crash safety."""
+    """Remove the temp arrays file. Registered with atexit for crash safety.
+    
+    Guard: Only the main process may delete the temp file. On Windows,
+    multiprocessing uses 'spawn', so every child worker re-imports this
+    module and re-registers atexit hooks. Without this guard, the first
+    worker to exit could delete the file while others still need it.
+    """
     global _ARRAYS_TEMP_PATH
+    if multiprocessing.current_process().name != 'MainProcess':
+        return
     if _ARRAYS_TEMP_PATH and os.path.exists(_ARRAYS_TEMP_PATH):
         try:
             os.remove(_ARRAYS_TEMP_PATH)
@@ -187,6 +231,7 @@ def signal_handler(signum, frame):
         
         # Manually trigger cleanup that os._exit would skip
         cleanup_arrays_file()
+        release_instance_lock()
         os._exit(1)
     
     SHUTDOWN_REQUESTED = True
@@ -215,12 +260,17 @@ class Config:
     intro_filter_seconds: float = 30.0
     video_timeout: int = 600
 
-def _normalize_pair(p1: str, p2: str) -> Tuple[str, str]:
-    return (p1, p2) if p1 <= p2 else (p2, p1)
-
 def _bat_safe_path(path: str) -> str:
     """Absolute path with % escaped to %% for cmd.exe."""
     return os.path.abspath(path).replace('%', '%%')
+
+def _safe_relpath(path: str, start: str) -> str:
+    """os.path.relpath that won't crash on different drives (Windows ValueError).
+    Falls back to absolute path when drives differ."""
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        return os.path.abspath(path)
 
 def get_results_folder_path(script_dir: str, root_dirs: List[str]) -> str:
     clean = lambda s: "".join(c if c.isalnum() or c in "-_" else "_" for c in s)[:20]
@@ -255,12 +305,14 @@ class UnionFind:
     def find(self, i):
         # Iterative find with path compression (avoids recursion limit)
         root = i
-        while self.parent.setdefault(root, root) != root:
+        while self.parent.get(root, root) != root:
             root = self.parent[root]
-        # Path compression
+        # Path compression — flatten chain so future lookups are O(1)
         curr = i
         while curr != root:
-            nxt = self.parent[curr]
+            nxt = self.parent.get(curr)
+            if nxt is None:
+                break
             self.parent[curr] = root
             curr = nxt
         return root
@@ -292,9 +344,13 @@ def get_quick_hash(filepath: str, chunk_size: int = 65536) -> Tuple[str, str]:
     """
     Compute a content-based hash that survives file moves and renames.
     
-    Reads first 64KB + last 64KB + file_size → MD5 truncated to 16 chars.
-    This is fast even on NAS (only 128KB max read) while being unique enough
-    for deduplication purposes.
+    Reads first 64KB + middle 64KB + last 64KB + file_size → MD5 truncated to 16 chars.
+    The middle chunk defends against CBR video files (dashcams, GoPros, security cameras)
+    that may share identical headers, file size, and even trailing data.
+    Only 192KB max read — fast even on Gigabit NAS.
+    
+    NOTE: Changing this algorithm invalidates all previously cached fingerprints.
+    They will be re-extracted on next run automatically (old keys become orphaned).
     
     Returns (hash, "") on success, ("", error_reason) on failure.
     """
@@ -307,6 +363,12 @@ def get_quick_hash(filepath: str, chunk_size: int = 65536) -> Tuple[str, str]:
             # Read first chunk
             first_chunk = f.read(chunk_size)
             hasher.update(first_chunk)
+            
+            # Read middle chunk if file is large enough (3+ chunks)
+            if file_size >= chunk_size * 3:
+                f.seek(file_size // 2)
+                mid_chunk = f.read(chunk_size)
+                hasher.update(mid_chunk)
             
             # Read last chunk if file is large enough
             if file_size >= chunk_size * 2:
@@ -340,7 +402,7 @@ def prompt_with_default(prompt: str, default: str) -> str:
 
 def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
     """Interactive configuration with settings preview, cache management, and CLI tips."""
-    comp_default = max(4, int(cpu_count * 0.75))
+    comp_default = max(1, min(cpu_count - 1, int(cpu_count * 0.75)))
     default_scale = 5
     dup_ratio = 0.99 - (default_scale - 1) * 0.005
     clip_ratio = 0.90 - (default_scale - 1) * 0.02
@@ -526,20 +588,30 @@ class UnifiedCache:
 
     def validate_params(self, config: Config) -> bool:
         conn = self._get_conn()
-        params = {'chunk_size': str(config.chunk_size), 'match_threshold': str(config.match_threshold)}
+        # hash_version tracks quick_hash algorithm changes — if it changes, ALL
+        # cached fingerprints are invalid (different keys for the same file).
+        # comparison params track the comparison algorithm — if they change, only
+        # comparisons need clearing (fingerprints are still valid).
+        HASH_VERSION = '2'  # Bump when quick_hash algorithm changes (e.g., added middle chunk)
+        
+        compare_params = {'chunk_size': str(config.chunk_size), 'match_threshold': str(config.match_threshold)}
+        all_params = {**compare_params, 'hash_version': HASH_VERSION}
+        
         try:
             stored = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM cache_params")}
         except sqlite3.Error:
             stored = {}
         if not stored:
-            conn.executemany("INSERT OR REPLACE INTO cache_params (key, value) VALUES (?, ?)", list(params.items()))
+            conn.executemany("INSERT OR REPLACE INTO cache_params (key, value) VALUES (?, ?)", list(all_params.items()))
             conn.commit()
             return True
-        mismatched = [f"{k}: {stored.get(k,'?')} -> {v}" for k, v in params.items() if stored.get(k) != v]
-        if mismatched:
-            print(f"   Warning: Algorithm params changed: {', '.join(mismatched)}")
-            print(f"   Auto-clearing comparison cache")
-            # DROP + CREATE is O(1) and avoids massive WAL bloat vs DELETE FROM
+        
+        # Check if hash algorithm changed — must clear EVERYTHING
+        if stored.get('hash_version') != HASH_VERSION:
+            old_ver = stored.get('hash_version', '1')
+            print(f"   Warning: Hash algorithm changed (v{old_ver} → v{HASH_VERSION})")
+            print(f"   Auto-clearing all caches (fingerprints + comparisons)")
+            conn.execute("DELETE FROM fingerprints")
             conn.execute("DROP TABLE IF EXISTS comparisons")
             conn.execute("""CREATE TABLE comparisons (
                 key1 TEXT NOT NULL, key2 TEXT NOT NULL,
@@ -547,7 +619,24 @@ class UnifiedCache:
                 matched_seconds REAL NOT NULL, PRIMARY KEY (key1, key2))""")
             conn.execute("CREATE INDEX idx_cmp_k1 ON comparisons(key1)")
             conn.execute("CREATE INDEX idx_cmp_k2 ON comparisons(key2)")
-            conn.executemany("INSERT OR REPLACE INTO cache_params (key, value) VALUES (?, ?)", list(params.items()))
+            conn.execute("DELETE FROM failed_files")
+            conn.executemany("INSERT OR REPLACE INTO cache_params (key, value) VALUES (?, ?)", list(all_params.items()))
+            conn.commit()
+            return False
+        
+        # Check if comparison params changed — only clear comparisons
+        mismatched = [f"{k}: {stored.get(k,'?')} -> {v}" for k, v in compare_params.items() if stored.get(k) != v]
+        if mismatched:
+            print(f"   Warning: Algorithm params changed: {', '.join(mismatched)}")
+            print(f"   Auto-clearing comparison cache")
+            conn.execute("DROP TABLE IF EXISTS comparisons")
+            conn.execute("""CREATE TABLE comparisons (
+                key1 TEXT NOT NULL, key2 TEXT NOT NULL,
+                match_ratio REAL NOT NULL, length_ratio REAL NOT NULL,
+                matched_seconds REAL NOT NULL, PRIMARY KEY (key1, key2))""")
+            conn.execute("CREATE INDEX idx_cmp_k1 ON comparisons(key1)")
+            conn.execute("CREATE INDEX idx_cmp_k2 ON comparisons(key2)")
+            conn.executemany("INSERT OR REPLACE INTO cache_params (key, value) VALUES (?, ?)", list(all_params.items()))
             conn.commit()
             return False
         return True
@@ -833,11 +922,10 @@ def _is_fpcalc_safe(path: str) -> bool:
 def _make_safe_path(original_path: str) -> Tuple[str, Optional[str]]:
     """
     Get an fpcalc-safe path. Tries 8.3 short path first.
-    If that still has unsafe chars, creates a temp hardlink or copy.
+    If that still has unsafe chars, creates a temp hardlink or symlink.
     
-    CRITICAL: Temp file is created in the SAME DIRECTORY as the original
-    so that hardlinks work (hardlinks cannot cross volumes). This avoids
-    copying multi-GB files over the network.
+    CRITICAL: Never copies video files to avoid network/SSD thrashing.
+    If all zero-copy methods fail, returns original path and lets fpcalc try.
     
     Returns (safe_path, cleanup_path_or_None).
     """
@@ -852,12 +940,11 @@ def _make_safe_path(original_path: str) -> Tuple[str, Optional[str]]:
         ext = '.tmp'
     safe_ext = ''.join(c for c in ext if c.isalnum() or c == '.')
     
-    # Get the directory of the original file — MUST create temp here for hardlink to work
+    # Get the directory of the original file
     original_dir = os.path.dirname(os.path.abspath(original_path))
     
     try:
         # Try hardlink in SAME directory (instant, zero-copy, same volume guaranteed)
-        # Use uuid to avoid race condition with mkstemp+delete on NAS
         temp_path = os.path.join(original_dir, f'vcd_{uuid.uuid4().hex}{safe_ext}')
         os.link(original_path, temp_path)
         return temp_path, temp_path
@@ -865,30 +952,106 @@ def _make_safe_path(original_path: str) -> Tuple[str, Optional[str]]:
         pass
     
     try:
-        # Hardlink failed (maybe filesystem doesn't support it, or permissions, or read-only)
-        # Fall back to copy IN THE SAME DIRECTORY to avoid cross-volume copy
+        # Try symlink in same directory (zero-copy, works cross-volume)
+        # Note: Windows symlinks require Developer Mode or Admin rights
         temp_path = os.path.join(original_dir, f'vcd_{uuid.uuid4().hex}{safe_ext}')
-        import shutil
-        shutil.copy2(original_path, temp_path)
+        os.symlink(original_path, temp_path)
         return temp_path, temp_path
     except OSError:
         pass
     
-    # Last resort: try system temp (will be slow for NAS files, but better than failing)
     try:
-        fd, temp_path = tempfile.mkstemp(suffix=safe_ext, prefix='vcd_')
-        os.close(fd)
-        import shutil
-        shutil.copy2(original_path, temp_path)
+        # Try symlink in system temp dir (works even if NAS is read-only)
+        # Symlinks are zero-byte pointers — no file data is copied over the network
+        temp_path = os.path.join(tempfile.gettempdir(), f'vcd_{uuid.uuid4().hex}{safe_ext}')
+        os.symlink(os.path.abspath(original_path), temp_path)
         return temp_path, temp_path
     except OSError:
-        # Give up — try the original path and let fpcalc fail with a clear error
-        return original_path, None
+        pass
+    
+    # Do NOT copy video files - could be multi-GB over network
+    # Better to let fpcalc try the original path and fail with a clear error
+    return original_path, None
+
+def _try_ffmpeg_fallback(original_path: str, video_timeout: int) -> Tuple[Optional[np.ndarray], float, str]:
+    """
+    ffmpeg fallback for containers that fpcalc can't handle (MPEG-PS, MPEG-TS, VOB).
+    Extracts audio to a temp WAV, then runs fpcalc on that.
+    
+    Returns (arr_or_None, duration, error_string).
+    """
+    if not FFMPEG_PATH:
+        return None, 0.0, "ffmpeg not available for fallback"
+    
+    temp_wav = None
+    try:
+        # Extract audio to temp WAV (PCM 16-bit, 44.1kHz, mono)
+        # This transcodes the audio stream into a format fpcalc always handles
+        fd, temp_wav = tempfile.mkstemp(suffix='.wav', prefix='vcd_ffmpeg_')
+        os.close(fd)
+        
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        
+        ffmpeg_cmd = [
+            FFMPEG_PATH, '-i', original_path,
+            '-vn',                    # No video
+            '-acodec', 'pcm_s16le',   # Raw PCM (universally supported)
+            '-ar', '44100',           # 44.1kHz
+            '-ac', '1',               # Mono (saves space, fpcalc only needs mono)
+            '-y',                     # Overwrite output
+            temp_wav
+        ]
+        
+        result = subprocess.run(
+            ffmpeg_cmd, capture_output=True, timeout=video_timeout,
+            startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        
+        if result.returncode != 0:
+            err = result.stderr.decode('utf-8', errors='ignore').strip()[-200:]
+            return None, 0.0, f"ffmpeg failed: {err}"
+        
+        if not os.path.exists(temp_wav) or os.path.getsize(temp_wav) < 1000:
+            return None, 0.0, "ffmpeg produced empty/tiny output"
+        
+        # Now run fpcalc on the clean WAV
+        fpcalc_cmd = [FPCALC_PATH, '-raw', '-length', '0', '-json', temp_wav]
+        fpcalc_result = subprocess.run(
+            fpcalc_cmd, capture_output=True, timeout=video_timeout,
+            startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        
+        if fpcalc_result.returncode != 0:
+            err = fpcalc_result.stderr.decode('utf-8', errors='ignore').strip()[:200]
+            return None, 0.0, f"fpcalc on ffmpeg WAV failed: {err}"
+        
+        data = json.loads(fpcalc_result.stdout.decode('utf-8'))
+        fp = data.get('fingerprint', [])
+        if not fp:
+            return None, 0.0, "ffmpeg WAV produced empty fingerprint"
+        
+        return np.array(fp, dtype=np.uint32), data.get('duration', 0.0), ""
+    
+    except subprocess.TimeoutExpired:
+        return None, 0.0, f"ffmpeg fallback timeout ({video_timeout}s)"
+    except Exception as e:
+        return None, 0.0, f"ffmpeg fallback error: {str(e)[:150]}"
+    finally:
+        if temp_wav:
+            try:
+                os.remove(temp_wav)
+            except OSError:
+                pass
 
 def extract_audio_fingerprint(args):
     """
     Extract Chromaprint fingerprint.
     Returns 7-tuple: (path, content_key, size, arr, duration, error, stderr_bytes)
+    
+    If fpcalc fails on MPEG-PS/TS containers and ffmpeg is available,
+    automatically falls back to ffmpeg audio extraction.
     """
     path, content_key, size, video_timeout = args
     process = None
@@ -937,11 +1100,28 @@ def extract_audio_fingerprint(args):
 
         if process.returncode != 0:
             err = stderr_bytes.decode('utf-8', errors='ignore').strip()[:200]
-            return path, content_key, size, None, 0.0, err or f"fpcalc exit code {process.returncode}", stderr_bytes
+            fpcalc_err = err or f"fpcalc exit code {process.returncode}"
+            
+            # ffmpeg fallback for containers that fpcalc can't handle
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _FFMPEG_FALLBACK_EXTENSIONS and FFMPEG_PATH:
+                arr, duration, ffmpeg_err = _try_ffmpeg_fallback(path, video_timeout)
+                if arr is not None:
+                    return path, content_key, size, arr, duration, "", b''
+                # Both failed — report both errors
+                return path, content_key, size, None, 0.0, f"{fpcalc_err} | ffmpeg: {ffmpeg_err}", stderr_bytes
+            
+            return path, content_key, size, None, 0.0, fpcalc_err, stderr_bytes
 
         data = json.loads(stdout_bytes.decode('utf-8'))
         fp = data.get('fingerprint', [])
         if not fp:
+            # Also try ffmpeg fallback for empty fingerprints (audio codec not supported)
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _FFMPEG_FALLBACK_EXTENSIONS and FFMPEG_PATH:
+                arr, duration, ffmpeg_err = _try_ffmpeg_fallback(path, video_timeout)
+                if arr is not None:
+                    return path, content_key, size, arr, duration, "", b''
             return path, content_key, size, None, 0.0, "Empty fingerprint (no audio stream?)", b''
         return path, content_key, size, np.array(fp, dtype=np.uint32), data.get('duration', 0.0), "", b''
 
@@ -1015,12 +1195,6 @@ def compare_batch(batch: List[Tuple[str, str]], config: Config):
 # HTML INTERACTIVE REPORT
 # ============================================================================
 
-def _html_escape(s: str) -> str:
-    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
-
-def _js_escape(s: str) -> str:
-    return s.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
-
 def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints, display_root, total_delete, total_savings):
     """Generate an interactive HTML report for reviewing duplicates."""
     html_path = os.path.join(results_dir, 'review_results.html')
@@ -1033,7 +1207,7 @@ def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints,
             abs_path = os.path.abspath(v['path'])
             files_js.append({
                 'path': abs_path,
-                'relpath': os.path.relpath(v['path'], display_root),
+                'relpath': _safe_relpath(v['path'], display_root),
                 'filename': os.path.basename(v['path']),
                 'dir': os.path.dirname(abs_path),
                 'size': v['size'],
@@ -1052,16 +1226,28 @@ def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints,
 
     clips_js = []
     for ci, (child, parents, ratio) in enumerate(clip_deletions):
-        fp = fingerprints.get(child, {})
+        child_fp = fingerprints.get(child, {})
+        parent_files = []
+        for p in parents[:3]:
+            pfp = fingerprints.get(p, {})
+            parent_files.append({
+                'path': os.path.abspath(p),
+                'dir': os.path.dirname(os.path.abspath(p)),
+                'name': os.path.basename(p),
+                'size': pfp.get('file_size', 0),
+                'size_fmt': format_size(pfp.get('file_size', 0)),
+                'dur_fmt': format_duration(pfp.get('duration', 0)),
+            })
         clips_js.append({
             'id': ci,
             'child_path': os.path.abspath(child),
-            'child_rel': os.path.relpath(child, display_root),
+            'child_dir': os.path.dirname(os.path.abspath(child)),
             'child_name': os.path.basename(child),
-            'child_size': format_size(fp.get('file_size', 0)),
-            'child_dur': format_duration(fp.get('duration', 0)),
+            'child_size': child_fp.get('file_size', 0),
+            'child_size_fmt': format_size(child_fp.get('file_size', 0)),
+            'child_dur': format_duration(child_fp.get('duration', 0)),
             'ratio': f"{ratio*100:.0f}%",
-            'parents': [os.path.basename(p) for p in parents[:3]],
+            'parents': parent_files,
             'delete': True,
         })
 
@@ -1114,6 +1300,15 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 .section-title {{ font-size: 20px; font-weight: bold; margin: 25px 0 15px; color: #4ecca3; }}
 .rename-info {{ font-size: 11px; color: #b388ff; margin-top: 4px; font-style: italic; }}
 .counter {{ position: fixed; top: 10px; right: 20px; background: #16213e; padding: 10px 15px; border-radius: 8px; font-size: 13px; z-index: 100; border: 1px solid #333; }}
+.file-link {{ color: #7eb8ff; text-decoration: none; cursor: pointer; }}
+.file-link:hover {{ text-decoration: underline; color: #a8d4ff; }}
+.btn-open {{ background: #2a5a8a; color: #fff; font-size: 11px; padding: 3px 8px; }}
+.btn-open:hover {{ background: #3a7aba; }}
+.folder-link {{ color: #888; font-size: 11px; text-decoration: none; }}
+.folder-link:hover {{ color: #aaa; text-decoration: underline; }}
+.rename-input {{ background: #1a1a2e; color: #e0e0e0; border: 1px solid #533483; border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 300px; margin-left: 4px; }}
+.rename-input:focus {{ outline: none; border-color: #b388ff; }}
+.dir-select {{ background: #1a1a2e; color: #e0e0e0; border: 1px solid #533483; border-radius: 4px; padding: 2px 4px; font-size: 11px; max-width: 400px; margin-left: 4px; }}
 </style>
 </head>
 <body>
@@ -1134,6 +1329,11 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 <div id="groups-container"></div>
 <div id="clips-container"></div>
 
+<div style="max-width:500px;margin:25px auto 5px;padding:12px 16px;background:#16213e;border-radius:8px;border:1px solid #333;font-size:12px;color:#aaa;text-align:center;">
+Use the button below to download a script with <b>your exact choices</b>.<br>
+The static RUN_DELETIONS.bat in the results folder uses the default recommendations, not your custom selections.
+</div>
+
 <button class="generate" onclick="generateScript()">Download Custom PowerShell Script</button>
 
 <script>
@@ -1153,7 +1353,7 @@ function init() {{
 
   DATA.groups.forEach((g, gi) => {{
     const keepIdx = g.files.findIndex(f => f.is_keep);
-    state[gi] = {{ keep: keepIdx >= 0 ? keepIdx : 0, rename_from: null, action: 'decided' }};
+    state[gi] = {{ keep: keepIdx >= 0 ? keepIdx : 0, rename_from: null, custom_name: null, target_dir: null, action: 'decided' }};
 
     let warn = g.size_warning ? ' warning' : (g.identical ? ' identical' : '');
     let badges = '';
@@ -1164,17 +1364,19 @@ function init() {{
     html += '<span class="badge badge-savings">Save ' + g.savings_fmt + '</span></div>';
 
     g.files.forEach((f, fi) => {{
+      const pe = pathEsc(f.path);
       html += '<div class="file-row" id="row-' + gi + '-' + fi + '">';
       html += '<div class="file-info">';
-      html += '<div class="file-path"><span class="file-name">' + escHtml(f.filename) + '</span></div>';
-      html += '<div class="file-path" style="font-size:11px;color:#666">' + escHtml(f.dir) + '</div>';
+      html += '<div class="file-path"><a class="file-link" href="#" onclick="openFile(\\'' + pe + '\\'); return false;"><span class="file-name">' + escHtml(f.filename) + '</span></a></div>';
+      html += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="openFolder(\\'' + pe + '\\'); return false;">' + escHtml(f.dir) + '</a></div>';
       html += '<div class="file-meta">' + f.size_fmt + ' &middot; ' + f.dur_fmt + '</div>';
       html += '<div class="rename-info" id="rename-info-' + gi + '-' + fi + '" style="display:none"></div>';
       html += '</div>';
       html += '<div class="actions">';
+      html += '<button class="btn btn-open" onclick="openFile(\\'' + pe + '\\')">Open</button>';
       html += '<button class="btn btn-keep" onclick="setKeep(' + gi + ',' + fi + ')">Keep</button>';
       html += '<button class="btn btn-delete" onclick="setDelete(' + gi + ',' + fi + ')">Delete</button>';
-      html += '<button class="btn btn-rename" onclick="setRename(' + gi + ',' + fi + ')" title="Keep the largest file but rename it to this file\'s name">Use Name</button>';
+      html += '<button class="btn btn-rename" onclick="setRename(' + gi + ',' + fi + ')" title="Keep the largest file but use this filename">Use Name</button>';
       html += '</div></div>';
     }});
 
@@ -1186,16 +1388,47 @@ function init() {{
   if (DATA.clips.length > 0) {{
     cc.innerHTML = '<div class="section-title">Redundant Clips (' + DATA.clips.length + ')</div>';
     DATA.clips.forEach((c, ci) => {{
-      clipState[ci] = c.delete;
-      let html = '<div class="clip-row" id="clip-' + ci + '">';
+      // State: keep='clip' or 'parent', rename_to=null/filename, action='decided'/'skipped'
+      clipState[ci] = {{ keep: 'parent', rename_to: null, custom_name: null, action: 'decided' }};
+      
+      const parent = c.parents[0] || {{}};
+      const parentPathEsc = pathEsc(parent.path || '');
+      const childPathEsc = pathEsc(c.child_path);
+      
+      let html = '<div class="card" id="clip-' + ci + '">';
+      html += '<div class="card-header"><span class="card-title">Clip ' + (ci+1) + ' <span class="badge badge-clip">' + c.ratio + ' match</span></span>';
+      html += '<span class="badge badge-savings">Clip is subset of parent</span></div>';
+      
+      // Parent file (longer, recommended keep)
+      html += '<div class="file-row selected-keep" id="clip-' + ci + '-parent">';
       html += '<div class="file-info">';
-      html += '<div class="file-path"><span class="file-name">' + escHtml(c.child_name) + '</span> <span class="badge badge-clip">' + c.ratio + ' match</span></div>';
-      html += '<div class="file-meta">' + c.child_size + ' &middot; ' + c.child_dur + ' &middot; Contained in: ' + c.parents.join(', ') + '</div>';
+      html += '<div class="file-path"><a class="file-link" href="#" onclick="openFile(\\'' + parentPathEsc + '\\'); return false;"><span class="file-name">' + escHtml(parent.name || 'Unknown') + '</span></a> <span style="color:#4ecca3;font-size:11px">PARENT (longer)</span></div>';
+      html += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="openFolder(\\'' + parentPathEsc + '\\'); return false;">' + escHtml(parent.dir || '') + '</a></div>';
+      html += '<div class="file-meta">' + (parent.size_fmt || '?') + ' &middot; ' + (parent.dur_fmt || '?') + '</div>';
+      html += '<div class="rename-info" id="clip-rename-' + ci + '-parent" style="display:none"></div>';
       html += '</div>';
-      html += '<div class="clip-toggle">';
-      html += '<button class="btn btn-delete active" id="clip-del-' + ci + '" onclick="toggleClip(' + ci + ',true)">Delete</button>';
-      html += '<button class="btn btn-skip" id="clip-skip-' + ci + '" onclick="toggleClip(' + ci + ',false)">Skip</button>';
+      html += '<div class="actions">';
+      html += '<button class="btn btn-open" onclick="openFile(\\'' + parentPathEsc + '\\')">Open</button>';
+      html += '<button class="btn btn-keep" onclick="setClipKeep(' + ci + ',\\'parent\\')">Keep</button>';
+      html += '<button class="btn btn-rename" onclick="setClipName(' + ci + ',\\'clip\\')" title="Keep parent but use clip filename">Use Name</button>';
       html += '</div></div>';
+      
+      // Clip file (shorter, recommended delete)
+      html += '<div class="file-row selected-delete" id="clip-' + ci + '-clip">';
+      html += '<div class="file-info">';
+      html += '<div class="file-path"><a class="file-link" href="#" onclick="openFile(\\'' + childPathEsc + '\\'); return false;"><span class="file-name">' + escHtml(c.child_name) + '</span></a> <span style="color:#e94560;font-size:11px">CLIP (shorter)</span></div>';
+      html += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="openFolder(\\'' + childPathEsc + '\\'); return false;">' + escHtml(c.child_dir) + '</a></div>';
+      html += '<div class="file-meta">' + c.child_size_fmt + ' &middot; ' + c.child_dur + '</div>';
+      html += '<div class="rename-info" id="clip-rename-' + ci + '-clip" style="display:none"></div>';
+      html += '</div>';
+      html += '<div class="actions">';
+      html += '<button class="btn btn-open" onclick="openFile(\\'' + childPathEsc + '\\')">Open</button>';
+      html += '<button class="btn btn-keep" onclick="setClipKeep(' + ci + ',\\'clip\\')">Keep</button>';
+      html += '<button class="btn btn-rename" onclick="setClipName(' + ci + ',\\'parent\\')" title="Keep clip but use parent filename">Use Name</button>';
+      html += '</div></div>';
+      
+      html += '<div style="text-align:right;margin-top:8px"><button class="btn btn-skip" onclick="setClipSkip(' + ci + ')">Skip</button></div>';
+      html += '</div>';
       cc.innerHTML += html;
     }});
   }}
@@ -1208,6 +1441,32 @@ function escHtml(s) {{
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}}
+
+function pathEsc(p) {{
+  // Escape path for use in onclick handlers (single-quoted JS string)
+  return p.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'").replace(/`/g, '\\\\`').replace(/"/g, '&quot;');
+}}
+
+function toFileUrl(path) {{
+  // Convert Windows path to file:// URL
+  const p = path.replace(/\\\\/g, '/');
+  if (p.startsWith('//')) {{
+    // UNC path: \\\\server\\share → file://server/share (RFC 8089)
+    return 'file:' + p;
+  }}
+  // Local drive: C:\\folder\\file.mp4 → file:///C:/folder/file.mp4
+  return 'file:///' + p;
+}}
+
+function openFile(path) {{
+  window.open(toFileUrl(path), '_blank');
+}}
+
+function openFolder(path) {{
+  // Open the containing folder
+  const folder = path.substring(0, path.lastIndexOf('\\\\'));
+  window.open(toFileUrl(folder), '_blank');
 }}
 
 function setKeep(gi, fi) {{
@@ -1230,6 +1489,8 @@ function setDelete(gi, fi) {{
 function setRename(gi, fi) {{
   if (state[gi].keep === fi) {{ return; }}
   state[gi].rename_from = fi;
+  state[gi].custom_name = DATA.groups[gi].files[fi].filename;
+  state[gi].target_dir = DATA.groups[gi].files[state[gi].keep].dir;
   state[gi].action = 'decided';
   updateGroupRows(gi);
   updateCounters();
@@ -1241,11 +1502,72 @@ function setSkip(gi) {{
   updateCounters();
 }}
 
-function toggleClip(ci, del) {{
-  clipState[ci] = del;
-  document.getElementById('clip-del-' + ci).className = 'btn btn-delete' + (del ? ' active' : '');
-  document.getElementById('clip-skip-' + ci).className = 'btn btn-skip' + (!del ? ' active' : '');
+function setClipKeep(ci, which) {{
+  clipState[ci].keep = which;
+  clipState[ci].rename_to = null;
+  clipState[ci].action = 'decided';
+  updateClipRows(ci);
   updateCounters();
+}}
+
+function setClipName(ci, useNameFrom) {{
+  // useNameFrom is which file's name to use (opposite of which we're keeping)
+  clipState[ci].rename_to = useNameFrom;
+  const c = DATA.clips[ci];
+  clipState[ci].custom_name = useNameFrom === 'clip' ? c.child_name : (c.parents[0] ? c.parents[0].name : '');
+  clipState[ci].action = 'decided';
+  updateClipRows(ci);
+  updateCounters();
+}}
+
+function setClipSkip(ci) {{
+  clipState[ci].action = 'skipped';
+  updateClipRows(ci);
+  updateCounters();
+}}
+
+function updateClipRows(ci) {{
+  const c = DATA.clips[ci];
+  const parentRow = document.getElementById('clip-' + ci + '-parent');
+  const clipRow = document.getElementById('clip-' + ci + '-clip');
+  const parentRename = document.getElementById('clip-rename-' + ci + '-parent');
+  const clipRename = document.getElementById('clip-rename-' + ci + '-clip');
+  
+  parentRow.className = 'file-row';
+  clipRow.className = 'file-row';
+  parentRename.style.display = 'none';
+  clipRename.style.display = 'none';
+  parentRename.innerHTML = '';
+  clipRename.innerHTML = '';
+  
+  if (clipState[ci].action === 'skipped') {{
+    parentRow.className = 'file-row selected-skip';
+    clipRow.className = 'file-row selected-skip';
+  }} else if (clipState[ci].keep === 'parent') {{
+    parentRow.className = 'file-row selected-keep';
+    clipRow.className = 'file-row selected-delete';
+    if (clipState[ci].rename_to === 'clip') {{
+      const curName = clipState[ci].custom_name || c.child_name;
+      let rhtml = '<span style="color:#b388ff">Rename to: </span>';
+      rhtml += '<input type="text" class="rename-input" value="' + escHtml(curName) + '" '
+        + 'onchange="clipState[' + ci + '].custom_name = this.value" '
+        + 'onclick="event.stopPropagation()" />';
+      parentRename.innerHTML = rhtml;
+      parentRename.style.display = 'block';
+    }}
+  }} else {{
+    clipRow.className = 'file-row selected-keep';
+    parentRow.className = 'file-row selected-delete';
+    if (clipState[ci].rename_to === 'parent') {{
+      const pname = clipState[ci].custom_name || (c.parents[0] ? c.parents[0].name : '');
+      let rhtml = '<span style="color:#b388ff">Rename to: </span>';
+      rhtml += '<input type="text" class="rename-input" value="' + escHtml(pname) + '" '
+        + 'onchange="clipState[' + ci + '].custom_name = this.value" '
+        + 'onclick="event.stopPropagation()" />';
+      clipRename.innerHTML = rhtml;
+      clipRename.style.display = 'block';
+    }}
+  }}
 }}
 
 function updateGroupRows(gi) {{
@@ -1255,14 +1577,30 @@ function updateGroupRows(gi) {{
     const renameInfo = document.getElementById('rename-info-' + gi + '-' + fi);
     row.className = 'file-row';
     renameInfo.style.display = 'none';
+    renameInfo.innerHTML = '';
 
     if (state[gi].action === 'skipped') {{
       row.className = 'file-row selected-skip';
     }} else if (fi === state[gi].keep) {{
       row.className = 'file-row selected-keep';
       if (state[gi].rename_from !== null) {{
-        const srcName = g.files[state[gi].rename_from].filename;
-        renameInfo.textContent = 'Will be renamed to: ' + srcName;
+        const curName = state[gi].custom_name || g.files[state[gi].rename_from].filename;
+        let rhtml = '<span style="color:#b388ff">Rename to: </span>';
+        rhtml += '<input type="text" class="rename-input" value="' + escHtml(curName) + '" '
+          + 'onchange="state[' + gi + '].custom_name = this.value" '
+          + 'onclick="event.stopPropagation()" />';
+        // Folder picker if files are in different directories
+        const dirs = [...new Set(g.files.map(x => x.dir))];
+        if (dirs.length > 1) {{
+          rhtml += '<br><span style="color:#b388ff;font-size:11px">Save in: </span>';
+          rhtml += '<select class="dir-select" onchange="state[' + gi + '].target_dir = this.value" onclick="event.stopPropagation()">';
+          dirs.forEach(d => {{
+            const sel = d === (state[gi].target_dir || f.dir) ? ' selected' : '';
+            rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
+          }});
+          rhtml += '</select>';
+        }}
+        renameInfo.innerHTML = rhtml;
         renameInfo.style.display = 'block';
       }}
     }} else {{
@@ -1273,6 +1611,7 @@ function updateGroupRows(gi) {{
 
 function updateAllRows() {{
   DATA.groups.forEach((_, gi) => updateGroupRows(gi));
+  DATA.clips.forEach((_, ci) => updateClipRows(ci));
 }}
 
 function updateCounters() {{
@@ -1282,7 +1621,12 @@ function updateCounters() {{
     dels += g.files.length - 1;
     if (state[gi].rename_from !== null) renames++;
   }});
-  DATA.clips.forEach((_, ci) => {{ if (clipState[ci]) dels++; }});
+  DATA.clips.forEach((c, ci) => {{
+    const cs = clipState[ci];
+    if (cs.action === 'skipped') {{ skips++; return; }}
+    dels++;
+    if (cs.rename_to !== null) renames++;
+  }});
   document.getElementById('del-count').textContent = dels;
   document.getElementById('rename-count').textContent = renames;
   document.getElementById('skip-count').textContent = skips;
@@ -1314,23 +1658,55 @@ function generateScript() {{
     }});
 
     if (state[gi].rename_from !== null) {{
-      const srcName = g.files[state[gi].rename_from].filename;
-      const keepDir = keepFile.dir;
-      const newPath = keepDir + '\\\\' + srcName;
+      const newName = (state[gi].custom_name || g.files[state[gi].rename_from].filename).replace(/'/g, "''");
       const oldP = keepFile.path.replace(/'/g, "''");
-      const newP = newPath.replace(/'/g, "''");
-      lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + srcName.replace(/'/g, "''") + "'");
+      const targetDir = state[gi].target_dir || keepFile.dir;
+      
+      if (targetDir !== keepFile.dir) {{
+        // Different directory — move + rename in one step
+        const dest = (targetDir + '\\\\' + (state[gi].custom_name || g.files[state[gi].rename_from].filename)).replace(/'/g, "''");
+        lines.push("Move-Item -LiteralPath '" + oldP + "' -Destination '" + dest + "' -Force");
+      }} else {{
+        // Same directory — just rename
+        lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newName + "'");
+      }}
     }}
     lines.push('');
   }});
 
   let hasClips = false;
   DATA.clips.forEach((c, ci) => {{
-    if (clipState[ci]) {{
-      if (!hasClips) {{ lines.push('# Redundant clips'); hasClips = true; }}
+    const cs = clipState[ci];
+    if (cs.action === 'skipped') return;
+    
+    if (!hasClips) {{ lines.push('# Redundant clips'); hasClips = true; }}
+    
+    const parent = c.parents[0] || {{}};
+    
+    if (cs.keep === 'parent') {{
+      // Delete clip, keep parent
       const p = c.child_path.replace(/'/g, "''");
       lines.push("Remove-Item -LiteralPath '" + p + "' -Force");
+      if (cs.rename_to === 'clip') {{
+        // Rename parent to clip's name (or custom name)
+        const oldP = parent.path.replace(/'/g, "''");
+        const newName = (cs.custom_name || c.child_name).replace(/'/g, "''");
+        lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newName + "'");
+      }}
+    }} else {{
+      // Delete parent, keep clip
+      if (parent.path) {{
+        const p = parent.path.replace(/'/g, "''");
+        lines.push("Remove-Item -LiteralPath '" + p + "' -Force");
+      }}
+      if (cs.rename_to === 'parent' && (cs.custom_name || parent.name)) {{
+        // Rename clip to parent's name (or custom name)
+        const oldP = c.child_path.replace(/'/g, "''");
+        const newName = (cs.custom_name || parent.name).replace(/'/g, "''");
+        lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newName + "'");
+      }}
     }}
+    lines.push('');
   }});
 
   lines.push('');
@@ -1386,7 +1762,7 @@ def find_media_files(root_dir):
 # ============================================================================
 
 def main():
-    global SHUTDOWN_REQUESTED, _ARRAYS_TEMP_PATH, _debug_logger
+    global SHUTDOWN_REQUESTED, _ARRAYS_TEMP_PATH, _debug_logger, FFMPEG_PATH
     signal.signal(signal.SIGINT, signal_handler)
 
     # Prevent multiple instances from corrupting the database
@@ -1399,6 +1775,8 @@ def main():
         print(f"❌ CRITICAL: {FPCALC_PATH} not found.")
         print("   Download from: https://acoustid.org/chromaprint")
         sys.exit(1)
+
+    FFMPEG_PATH = _find_ffmpeg()
 
     parser = argparse.ArgumentParser(description='VidClipDuplis (VCD) — Audio Duplicate & Clip Finder',
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1492,7 +1870,7 @@ def main():
         if args.compare_workers > 0:
             config.comparison_workers = args.compare_workers
         else:
-            config.comparison_workers = max(4, int(cpu_count * 0.75))
+            config.comparison_workers = max(1, min(cpu_count - 1, int(cpu_count * 0.75)))
         if args.clip_ratio > 0:
             config.clip_match_ratio = max(0.01, min(1.0, args.clip_ratio))
         if args.dup_ratio > 0:
@@ -1504,13 +1882,17 @@ def main():
 
     cache.validate_params(config)
 
-    print(f"\n⚙️  Settings:")
+    print(f"\n⚙️ Settings:")
     print(f"   Extraction workers:  {config.max_workers}")
     print(f"   Comparison workers:  {config.comparison_workers}")
     print(f"   Clip threshold:      {config.clip_match_ratio:.0%}")
     print(f"   Duplicate threshold: {config.duplicate_match_ratio:.0%}")
     print(f"   Intro filter:        {config.intro_filter_seconds}s")
     print(f"   Cache: {cache_path}")
+    if FFMPEG_PATH:
+        print(f"   ffmpeg: {FFMPEG_PATH} (fallback for .mpg/.vob/.ts)")
+    else:
+        print(f"   ffmpeg: not found (no fallback for MPEG-PS/TS failures)")
 
     # Phase 0: Scan files
     for d in root_dirs:
@@ -1698,18 +2080,18 @@ def main():
                 dup_matches_identical.append((path1, path2, 1.0))  # 100% match
 
     # Get content_keys that need fingerprint comparison
-    # (only keys that appear exactly once in key_to_paths AND have valid fingerprints)
-    content_keys_for_comparison = sorted([
-        ck for ck in hash_arrays.keys() 
-        if len(key_to_paths.get(ck, [])) == 1  # Only compare unique files
-    ])
+    # ALL keys with valid fingerprints are compared against each other.
+    # Byte-identical files (same content_key) are already handled above —
+    # but their content_key still needs comparison against OTHER keys
+    # to discover clip relationships (e.g., 3 copies of a trailer + full movie).
+    content_keys_for_comparison = sorted(hash_arrays.keys())
     
     total_pairs = len(content_keys_for_comparison) * (len(content_keys_for_comparison) - 1) // 2
     
     print(f"\n📊 Fingerprint comparison:")
     print(f"   Total fingerprints: {len(hash_arrays)}")
-    print(f"   Byte-identical groups: {len(identical_groups)} (skipping comparison)")
-    print(f"   Unique files to compare: {len(content_keys_for_comparison)}")
+    print(f"   Byte-identical groups: {len(identical_groups)} (already grouped)")
+    print(f"   Content keys to cross-compare: {len(content_keys_for_comparison)}")
     print(f"   Comparison pairs: {total_pairs:,}")
 
     # Generate all pairs (using content_keys) for files that aren't already identical
@@ -1735,18 +2117,22 @@ def main():
         cached_count = len(cached_comparisons)
 
         # Process cached comparisons - convert content_key matches to path matches
+        # For content_keys with multiple paths (identical copies), we must emit
+        # matches for ALL paths so clip relationships aren't lost when one copy
+        # ends up in dup_delete_set and another in keep_set.
         for (k1, k2), (mr, lr, ms) in cached_comparisons.items():
             is_dup, is_clip = classify_comparison(mr, lr, ms, config)
-            # Get paths for these content_keys (there's exactly one path per key for compared files)
             paths1 = key_to_paths.get(k1, [])
             paths2 = key_to_paths.get(k2, [])
             if paths1 and paths2:
-                p1 = paths1[0][0]
-                p2 = paths2[0][0]
                 if is_dup:
-                    dup_matches.append((p1, p2, mr))
+                    # Union-Find is transitive: one pair per key suffices
+                    dup_matches.append((paths1[0][0], paths2[0][0], mr))
                 elif is_clip:
-                    clip_matches.append((p1, p2, mr))
+                    # Clips are directed edges — every path needs its own entry
+                    for pt1 in paths1:
+                        for pt2 in paths2:
+                            clip_matches.append((pt1[0], pt2[0], mr))
 
         print(f"   Cached: {cached_count:,}, To compute: {len(pairs_to_compute):,}")
     else:
@@ -1794,14 +2180,14 @@ def main():
                             paths1 = key_to_paths.get(k1, [])
                             paths2 = key_to_paths.get(k2, [])
                             if paths1 and paths2:
-                                p1 = paths1[0][0]
-                                p2 = paths2[0][0]
                                 if is_dup:
-                                    dup_matches.append((p1, p2, mr))
-                                    tqdm.write(f"   ✅ DUP ({mr*100:.1f}%): {os.path.basename(p1)} ↔ {os.path.basename(p2)}")
+                                    dup_matches.append((paths1[0][0], paths2[0][0], mr))
+                                    tqdm.write(f"   ✅ DUP ({mr*100:.1f}%): {os.path.basename(paths1[0][0])} ↔ {os.path.basename(paths2[0][0])}")
                                 elif is_clip:
-                                    clip_matches.append((p1, p2, mr))
-                                    tqdm.write(f"   📎 CLIP ({mr*100:.1f}%): {os.path.basename(p1)} ↔ {os.path.basename(p2)}")
+                                    for pt1 in paths1:
+                                        for pt2 in paths2:
+                                            clip_matches.append((pt1[0], pt2[0], mr))
+                                    tqdm.write(f"   📎 CLIP ({mr*100:.1f}%): {os.path.basename(paths1[0][0])} ↔ {os.path.basename(paths2[0][0])}")
                         pbar.update(future_to_size[future])
                         if len(batch_buf) >= 5000:
                             cache.batch_set_comparisons(batch_buf)
@@ -1853,8 +2239,8 @@ def main():
     
     dup_groups_raw = defaultdict(list)
     for path in all_paths:
-        uf.find(path)
-        dup_groups_raw[uf.find(path)].append(path)
+        root = uf.find(path)
+        dup_groups_raw[root].append(path)
 
     dup_groups, keep_set, dup_delete_set = [], set(), set()
     for gp in dup_groups_raw.values():
@@ -1943,7 +2329,7 @@ def main():
                 print(f"   🔥  Byte-for-byte identical copies!")
             for v in g['videos']:
                 marker = "✓ KEEP  " if v['path'] == g['recommend_keep'] else "✗ DELETE"
-                print(f"   {marker} {os.path.relpath(v['path'], display_root)}")
+                print(f"   {marker} {_safe_relpath(v['path'], display_root)}")
                 print(f"            {format_size(v['size'])}, {format_duration(v['duration']) if v['duration'] else '?'}")
         if len(dup_groups) > 15:
             print(f"\n   ... and {len(dup_groups)-15} more groups")
@@ -1957,7 +2343,7 @@ def main():
                 pnames += f" (+{len(parents)-3})"
             print(f"\n{'─'*50}")
             print(f"Clip {i} ({ratio*100:.0f}% match)")
-            print(f"   ✗ DELETE  {os.path.relpath(child, display_root)}")
+            print(f"   ✗ DELETE  {_safe_relpath(child, display_root)}")
             print(f"             {format_size(path_fingerprints[child]['file_size'])}, {format_duration(path_fingerprints[child].get('duration', 0))}")
             print(f"   ↳ Contained in: {pnames}")
         if len(clip_deletions) > 15:
@@ -1995,11 +2381,11 @@ def main():
                 'potential_savings': format_size(g['potential_savings']),
                 'size_warning': g.get('size_warning', False),
                 'identical': g.get('identical', False),
-                'recommend_keep': os.path.relpath(g['recommend_keep'], display_root),
-                'recommend_delete': [os.path.relpath(p, display_root) for p in g['recommend_delete']],
+                'recommend_keep': _safe_relpath(g['recommend_keep'], display_root),
+                'recommend_delete': [_safe_relpath(p, display_root) for p in g['recommend_delete']],
                 'files': [
                     {
-                        'path': os.path.relpath(v['path'], display_root), 
+                        'path': _safe_relpath(v['path'], display_root), 
                         'size': format_size(v['size']),
                         'duration': format_duration(v['duration']) if v['duration'] else '?',
                         'action': 'KEEP' if v['path'] == g['recommend_keep'] else 'DELETE'
@@ -2011,11 +2397,11 @@ def main():
         ],
         'redundant_clips': [
             {
-                'clip': os.path.relpath(c, display_root), 
+                'clip': _safe_relpath(c, display_root), 
                 'clip_size': format_size(path_fingerprints[c]['file_size']),
                 'clip_duration': format_duration(path_fingerprints[c].get('duration', 0)), 
                 'match_ratio': f"{r*100:.1f}%",
-                'contained_in': [os.path.relpath(p, display_root) for p in ps]
+                'contained_in': [_safe_relpath(p, display_root) for p in ps]
             } 
             for c, ps, r in clip_deletions
         ],
@@ -2029,7 +2415,7 @@ def main():
         f.write(f'REM {total_delete} files, {format_size(total_savings)} potential savings\n')
         f.write('echo WARNING: This will PERMANENTLY delete files!\npause\n\n')
         for g in dup_groups:
-            f.write(f'REM Keep: {os.path.relpath(g["recommend_keep"], display_root)}\n')
+            f.write(f'REM Keep: {_safe_relpath(g["recommend_keep"], display_root)}\n')
             if g.get('size_warning'):
                 f.write('REM SIZE MISMATCH — uncomment only if verified:\n')
                 for p in g['recommend_delete']:
