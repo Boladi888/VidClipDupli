@@ -933,7 +933,8 @@ class UnifiedCache:
             if any(v > 0 for v in removed.values()):
                 print("   Reclaiming disk space (VACUUM)...")
                 conn.execute("VACUUM")
-            
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                
         except sqlite3.Error as e:
             print(f"Warning: Cleanup error: {e}")
         
