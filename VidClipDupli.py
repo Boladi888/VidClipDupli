@@ -67,9 +67,6 @@ _ARRAYS_TEMP_PATH: Optional[str] = None
 _debug_logger: Optional[logging.Logger] = None
 _INSTANCE_LOCK_FD: Optional[int] = None
 
-# Containers that fpcalc often fails on — ffmpeg fallback will pre-extract audio
-_FFMPEG_FALLBACK_EXTENSIONS = {'.mpg', '.vob', '.ts', '.mpeg', '.m2ts', '.mts'}
-
 def _find_ffmpeg() -> Optional[str]:
     """Find ffmpeg.exe — check script directory first, then PATH."""
     local = os.path.join(_BASE_DIR, 'ffmpeg.exe')
@@ -400,8 +397,9 @@ def prompt_with_default(prompt: str, default: str) -> str:
     except (EOFError, KeyboardInterrupt):
         return default
 
-def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
-    """Interactive configuration with settings preview, cache management, and CLI tips."""
+def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Tuple[Config, bool]:
+    """Interactive configuration with settings preview, cache management, and CLI tips.
+    Returns (Config, cleanup_requested)."""
     comp_default = max(1, min(cpu_count - 1, int(cpu_count * 0.75)))
     default_scale = 5
     dup_ratio = 0.99 - (default_scale - 1) * 0.005
@@ -457,6 +455,8 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
     print(f"    2. Clear comparisons     (re-compare with new thresholds)")
     print(f"    3. Clear everything      (start completely fresh)")
     print(f"    4. No changes            (keep cache as-is)")
+    print(f"    5. Cleanup orphans       (remove data for deleted/moved files, shrink DB)")
+    print(f"       DB size: {format_size(cache.get_db_size())}")
     
     cache_choice = input("\n  Cache action? [4]: ").strip()
     if cache_choice == '1':
@@ -470,12 +470,17 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
         cache.clear_comparisons()
         cache.clear_failed()
         print("  🗑️  All caches cleared")
+    elif cache_choice == '5':
+        print("  🔍 Cleanup runs after scanning (needs file list to know what's orphaned)")
+
+    _cleanup_requested = cache_choice == '5'
 
     print(f"\n  CLI tip: you can skip this menu with command-line flags:")
     print(f"    --no-prompt              Use defaults, skip interactive setup")
     print(f"    --clear-failed           Retry previously failed files")
     print(f"    --clear-comparisons      Re-compare with different thresholds")
     print(f"    --clear-cache            Wipe everything and start fresh")
+    print(f"    --cleanup-cache          Remove data for deleted/moved files, shrink DB")
     print(f"    -w 4                     Set extraction workers")
     print(f"    -c 16                    Set comparison workers")
     print(f"    --clip-ratio 0.50        Set clip match threshold")
@@ -518,9 +523,9 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Config:
             duplicate_match_ratio=round(dup_ratio, 3),
             intro_filter_seconds=intro_filter,
             video_timeout=timeout,
-        )
+        ), _cleanup_requested
     else:
-        return Config(comparison_workers=comp_default, video_timeout=600)
+        return Config(comparison_workers=comp_default, video_timeout=600), _cleanup_requested
 
 # ============================================================================
 # UNIFIED SQLITE CACHE
@@ -860,6 +865,91 @@ class UnifiedCache:
         except sqlite3.Error:
             pass
 
+    def cleanup_orphans(self, active_keys: set, root_dirs: List[str]) -> Dict[str, int]:
+        """
+        Remove cached data for files that no longer exist in the scanned directories.
+        
+        SCOPED TO ROOT_DIRS ONLY: Only deletes fingerprints whose current_path falls
+        under one of the scanned directories. Fingerprints from other directories
+        (e.g., a different NAS share scanned last week) are left untouched.
+        
+        Comparisons are only deleted if BOTH keys are orphaned within scope.
+        Then VACUUMs to reclaim disk space.
+        
+        Returns dict with counts of removed entries.
+        """
+        removed = {'fingerprints': 0, 'comparisons': 0, 'failed': 0}
+        try:
+            conn = self._get_conn()
+            
+            # Step 1: Find all content_keys in the DB whose current_path falls under
+            # one of the scanned root_dirs — these are "in scope" for cleanup
+            # os.path.join(rd, '') ensures trailing separator so Z:\Movies doesn't match Z:\Movies_Docs
+            safe_roots = [os.path.join(rd, '').lower() for rd in root_dirs]
+            in_scope_keys = set()
+            for row in conn.execute("SELECT content_key, current_path FROM fingerprints"):
+                ck, stored_path = row[0], (row[1] or '').lower()
+                for sr in safe_roots:
+                    if stored_path.startswith(sr):
+                        in_scope_keys.add(ck)
+                        break
+            
+            # Orphans = in-scope keys that aren't in the current scan's active_keys
+            orphan_keys = in_scope_keys - active_keys
+            
+            if not orphan_keys:
+                return removed
+            
+            # Create temp table of orphan keys for efficient deletes
+            conn.execute("DROP TABLE IF EXISTS temp_orphan_keys")
+            conn.execute("CREATE TEMP TABLE temp_orphan_keys (key TEXT PRIMARY KEY)")
+            keys_list = list(orphan_keys)
+            for i in range(0, len(keys_list), 50000):
+                conn.executemany("INSERT OR IGNORE INTO temp_orphan_keys VALUES (?)",
+                                 [(k,) for k in keys_list[i:i+50000]])
+            
+            # Count and delete orphaned fingerprints
+            removed['fingerprints'] = len(orphan_keys)
+            conn.execute("DELETE FROM fingerprints WHERE content_key IN (SELECT key FROM temp_orphan_keys)")
+            
+            # Delete comparisons where EITHER key is orphaned
+            removed['comparisons'] = conn.execute(
+                "SELECT COUNT(*) FROM comparisons WHERE key1 IN (SELECT key FROM temp_orphan_keys) OR key2 IN (SELECT key FROM temp_orphan_keys)"
+            ).fetchone()[0]
+            if removed['comparisons'] > 0:
+                conn.execute("DELETE FROM comparisons WHERE key1 IN (SELECT key FROM temp_orphan_keys) OR key2 IN (SELECT key FROM temp_orphan_keys)")
+            
+            # Delete orphaned failed entries
+            removed['failed'] = conn.execute(
+                "SELECT COUNT(*) FROM failed_files WHERE content_key IN (SELECT key FROM temp_orphan_keys)"
+            ).fetchone()[0]
+            if removed['failed'] > 0:
+                conn.execute("DELETE FROM failed_files WHERE content_key IN (SELECT key FROM temp_orphan_keys)")
+            
+            conn.execute("DROP TABLE IF EXISTS temp_orphan_keys")
+            conn.commit()
+            
+            # VACUUM reclaims disk space (rewrites the entire DB file)
+            if any(v > 0 for v in removed.values()):
+                print("   Reclaiming disk space (VACUUM)...")
+                conn.execute("VACUUM")
+            
+        except sqlite3.Error as e:
+            print(f"Warning: Cleanup error: {e}")
+        
+        return removed
+
+    def get_db_size(self) -> int:
+        """Get total size of DB file + WAL + SHM in bytes."""
+        total = 0
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                pass
+        return total
+
 # ============================================================================
 # EXTRACTION
 # ============================================================================
@@ -911,8 +1001,12 @@ def _get_short_path(long_path: str) -> str:
         return long_path
 
 # Characters that cause fpcalc/FFmpeg to choke
-_FPCALC_UNSAFE_CHARS = set('[]{}')
-
+# [] {} — treated as pattern/sequence characters by FFmpeg demuxer
+# #     — treated as URL fragment separator (everything after # is ignored)
+# %     — treated as URL percent-encoding prefix
+# &     — treated as URL query separator
+# （）【】 — fullwidth CJK punctuation that survives 8.3 conversion on some NAS
+_FPCALC_UNSAFE_CHARS = set('[]{}#%&（）【】')
 def _is_fpcalc_safe(path: str) -> bool:
     """Check if a path is safe to pass directly to fpcalc."""
     if not path.isascii():
@@ -1102,9 +1196,8 @@ def extract_audio_fingerprint(args):
             err = stderr_bytes.decode('utf-8', errors='ignore').strip()[:200]
             fpcalc_err = err or f"fpcalc exit code {process.returncode}"
             
-            # ffmpeg fallback for containers that fpcalc can't handle
-            ext = os.path.splitext(path)[1].lower()
-            if ext in _FFMPEG_FALLBACK_EXTENSIONS and FFMPEG_PATH:
+            # ffmpeg fallback — try on ANY fpcalc failure, not just specific extensions
+            if FFMPEG_PATH:
                 arr, duration, ffmpeg_err = _try_ffmpeg_fallback(path, video_timeout)
                 if arr is not None:
                     return path, content_key, size, arr, duration, "", b''
@@ -1117,8 +1210,7 @@ def extract_audio_fingerprint(args):
         fp = data.get('fingerprint', [])
         if not fp:
             # Also try ffmpeg fallback for empty fingerprints (audio codec not supported)
-            ext = os.path.splitext(path)[1].lower()
-            if ext in _FFMPEG_FALLBACK_EXTENSIONS and FFMPEG_PATH:
+            if FFMPEG_PATH:
                 arr, duration, ffmpeg_err = _try_ffmpeg_fallback(path, video_timeout)
                 if arr is not None:
                     return path, content_key, size, arr, duration, "", b''
@@ -1789,6 +1881,7 @@ def main():
     parser.add_argument('--clear-cache', action='store_true', help='Clear all cached data')
     parser.add_argument('--clear-comparisons', action='store_true', help='Clear comparisons only')
     parser.add_argument('--clear-failed', action='store_true', help='Clear failed file list')
+    parser.add_argument('--cleanup-cache', action='store_true', help='Remove cached data for files no longer in scanned dirs')
     parser.add_argument('--timeout', type=int, default=600, help='Timeout per file (default: 600)')
     parser.add_argument('--no-prompt', action='store_true', help='Skip interactive setup')
     args = parser.parse_args()
@@ -1863,6 +1956,8 @@ def main():
     has_cli_config = (args.workers > 0 or args.compare_workers > 0 or args.clip_ratio > 0
                       or args.dup_ratio > 0 or args.intro_filter >= 0 or args.no_prompt)
 
+    do_cleanup = args.cleanup_cache
+
     if has_cli_config:
         config = Config(video_timeout=args.timeout)
         if args.workers > 0:
@@ -1878,11 +1973,12 @@ def main():
         if args.intro_filter >= 0:
             config.intro_filter_seconds = args.intro_filter
     else:
-        config = interactive_setup(cpu_count, cache)
+        config, interactive_cleanup = interactive_setup(cpu_count, cache)
+        do_cleanup = do_cleanup or interactive_cleanup
 
     cache.validate_params(config)
 
-    print(f"\n⚙️ Settings:")
+    print(f"\n⚙️  Settings:")
     print(f"   Extraction workers:  {config.max_workers}")
     print(f"   Comparison workers:  {config.comparison_workers}")
     print(f"   Clip threshold:      {config.clip_match_ratio:.0%}")
@@ -1890,9 +1986,9 @@ def main():
     print(f"   Intro filter:        {config.intro_filter_seconds}s")
     print(f"   Cache: {cache_path}")
     if FFMPEG_PATH:
-        print(f"   ffmpeg: {FFMPEG_PATH} (fallback for .mpg/.vob/.ts)")
+        print(f"   ffmpeg: {FFMPEG_PATH} (fallback for any fpcalc failure)")
     else:
-        print(f"   ffmpeg: not found (no fallback for MPEG-PS/TS failures)")
+        print(f"   ffmpeg: not found (no fallback for fpcalc failures)")
 
     # Phase 0: Scan files
     for d in root_dirs:
@@ -1919,7 +2015,9 @@ def main():
     key_to_paths: Dict[str, List[Tuple[str, int, float]]] = defaultdict(list)  # content_key -> [(path, size, mtime), ...]
     hash_errors = []  # (path, error_reason) for logging
     
-    for path, size, mtime in tqdm(media_files, unit="file", desc="   Hashing"):
+    for path, size, mtime in tqdm(media_files, unit="file", desc="   Hashing",
+                                    dynamic_ncols=False, smoothing=0.05,
+                                    bar_format="   Hashing: {n_fmt}/{total_fmt} files [{bar:25}] {percentage:.0f}% | {rate_fmt} | Elapsed: {elapsed} | ETA: {remaining}"):
         content_key, hash_err = get_quick_hash(path)
         if content_key:
             key_to_paths[content_key].append((path, size, mtime))
@@ -1943,6 +2041,24 @@ def main():
         identical_file_count = sum(len(paths) for _, paths in identical_groups)
         print(f"   🔥 {len(identical_groups)} groups of byte-for-byte identical files ({identical_file_count} files)")
         print(f"      These will be reported as duplicates WITHOUT fingerprint comparison!")
+
+    # Cache cleanup: remove orphaned data for files no longer in scanned directories
+    if do_cleanup:
+        if hash_errors:
+            print(f"\n⚠️  Skipping cache cleanup — {len(hash_errors)} files could not be hashed")
+            print(f"   (locked/inaccessible files would be wrongly treated as deleted)")
+        else:
+            print(f"\n🧹 Cleaning up orphaned cache entries...")
+            print(f"   Scoped to: {', '.join(root_dirs)}")
+            print(f"   DB size before: {format_size(cache.get_db_size())}")
+            active_keys = set(key_to_paths.keys())
+            removed = cache.cleanup_orphans(active_keys, root_dirs)
+            total_removed = sum(removed.values())
+            if total_removed > 0:
+                print(f"   Removed: {removed['fingerprints']:,} fingerprints, {removed['comparisons']:,} comparisons, {removed['failed']:,} failed entries")
+                print(f"   DB size after:  {format_size(cache.get_db_size())}")
+            else:
+                print(f"   No orphaned entries found — cache is clean")
 
     # Load cached fingerprints
     all_cached_fps = cache.get_all_fingerprints()  # keyed by content_key
@@ -2014,7 +2130,8 @@ def main():
         print(f"   ⌨️  Press Ctrl+C once to stop gracefully, twice to force quit.")
         
         extraction_args = [(p, ck, s, config.video_timeout) for p, ck, s, m in to_process]
-        pbar = tqdm(total=len(to_process), unit="file")
+        pbar = tqdm(total=len(to_process), unit="file", dynamic_ncols=False, smoothing=0.02,
+                   bar_format="   Extracted: {n_fmt}/{total_fmt} files [{bar:25}] {percentage:.0f}% | {rate_fmt} | Elapsed: {elapsed} | ETA: {remaining}")
         failed_count = 0
         
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
@@ -2153,7 +2270,8 @@ def main():
 
         batches = [pairs_to_compute[i:i+config.comparison_batch_size] 
                    for i in range(0, len(pairs_to_compute), config.comparison_batch_size)]
-        pbar = tqdm(total=len(pairs_to_compute), unit="pair")
+        pbar = tqdm(total=len(pairs_to_compute), unit="pair", dynamic_ncols=False, smoothing=0.02,
+                   bar_format="   Compared: {n_fmt}/{total_fmt} pairs [{bar:25}] {percentage:.0f}% | {rate_fmt} | Elapsed: {elapsed} | ETA: {remaining}")
         
         try:
             with ProcessPoolExecutor(max_workers=config.comparison_workers, 

@@ -32,7 +32,7 @@ python VidClipDupli.py "Z:\Movies" "Z:\TV Shows" "Z:\Clips" --no-prompt
 
 ### Optional: ffmpeg for better container support
 
-Place `ffmpeg.exe` next to the script (or ensure it's on your PATH). When fpcalc fails on MPEG-PS/TS containers (`.mpg`, `.vob`, `.ts`, `.mpeg`, `.m2ts`, `.mts`), VCD will automatically extract audio with ffmpeg and retry. Download from [ffmpeg.org](https://ffmpeg.org/download.html).
+Place `ffmpeg.exe` next to the script (or ensure it's on your PATH). When fpcalc fails on any file, VCD will automatically extract audio with ffmpeg and retry. Download from [ffmpeg.org](https://ffmpeg.org/download.html).
 
 ---
 
@@ -42,7 +42,7 @@ Place `ffmpeg.exe` next to the script (or ensure it's on your PATH). When fpcalc
 Phase 0: Scan        Find all media files in target directories
 Phase 0.5: Hash      Compute content keys (quick_hash) for cache lookup
 Phase 1: Extract     fpcalc decodes the full audio stream → uint32 fingerprint array
-                     (ffmpeg fallback for MPEG-PS/TS containers if available)
+                     (ffmpeg fallback for any fpcalc failure if available)
 Phase 2: Cache       Look up previously computed comparisons in SQLite
 Phase 3: Compare     Sliding-window XOR + popcount across all pairs (multi-core)
 Phase 4: Group       Union-Find for duplicates, directed edges for clips
@@ -114,6 +114,7 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 | `--clear-cache` | — | Wipe all cached data and start fresh. |
 | `--clear-comparisons` | — | Wipe comparisons only (keeps fingerprints). Use when changing thresholds. |
 | `--clear-failed` | — | Retry previously failed files. |
+| `--cleanup-cache` | — | Remove cached data for files no longer in scanned directories and shrink DB. |
 | `--no-prompt` | — | Skip interactive setup, use all defaults. |
 
 ---
@@ -138,6 +139,9 @@ python VidClipDupli.py "D:\Videos" --clear-comparisons --clip-ratio 0.60
 
 # Find very short clips (disable the 30-second intro filter)
 python VidClipDupli.py "D:\Videos" --intro-filter 0
+
+# Clean up cached data for files you've deleted from the NAS
+python VidClipDupli.py "Z:\Movies" --cleanup-cache
 ```
 
 ---
@@ -148,7 +152,7 @@ python VidClipDupli.py "D:\Videos" --intro-filter 0
 - **numpy**, **tqdm** (`pip install numpy tqdm`)
 - **fpcalc.exe** from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) — place in the script directory
 - **Windows 10/11** (uses Windows-specific subprocess flags and short path API)
-- **ffmpeg** (optional) — enables fallback for `.mpg`, `.vob`, `.ts` files that fpcalc can't handle
+- **ffmpeg** (optional) — enables fallback for any file that fpcalc can't handle
 - Works on any CPU (Intel, AMD, ARM). No GPU needed.
 
 ---
@@ -171,16 +175,18 @@ The three-point sampling (start, middle, end) prevents collisions between same-s
 **Cache file:** `.audio_cache.db` in the script directory
 
 **Schema:**
-- `fingerprints` — content_key (PRIMARY KEY), current_path, file_size, fingerprint, duration
-- `comparisons` — key1, key2 (PRIMARY KEY), match_ratio, length_ratio, matched_seconds
-- `failed_files` — content_key (PRIMARY KEY), last_path, reason
-- `cache_params` — tracks algorithm version; auto-clears stale data on upgrades
+- `fingerprints` — content_key, current_path, file_size, fingerprint, duration
+- `comparisons` — key1, key2, match_ratio, length_ratio, matched_seconds
+- `failed_files` — content_key, last_path, reason
+- `cache_params` — tracks algorithm version and comparison params; auto-clears stale data on upgrades
+
+**Cache cleanup:** Use `--cleanup-cache` or option 5 in the interactive menu to remove cached data for files that have been deleted from the scanned directories. This is scoped — only data for files under the directories you're currently scanning is affected. Data from other directories (scanned in previous runs) is left untouched. Cleanup is automatically skipped if any files were inaccessible during scanning to prevent false deletion of valid cache entries.
 
 ---
 
 ## Unicode & Special Characters
 
-VCD handles filenames with Chinese, Japanese, Korean, emoji, brackets, and other special characters through a multi-step fallback chain:
+VCD handles filenames with Chinese, Japanese, Korean, emoji, brackets, `#`, `%`, `&`, and other special characters through a multi-step fallback chain:
 
 1. **8.3 short path** — Converts to DOS-safe `FILENA~1.MKV` via Windows API
 2. **Hardlink** — Creates a safe-named hardlink in the same directory (zero-copy)
@@ -200,7 +206,7 @@ No files are ever copied. The entire chain is zero-copy.
 | **Full audio decode** | First run on 3000+ files over Gigabit NAS takes 15-30 hours | Cached — subsequent runs are near-instant |
 | **Content-based cache** | Editing a file (even just metadata) may trigger re-extraction | Only if first/middle/last 64KB or size changes |
 | **Time-agnostic matching** | Compilations with scattered fragments may hit clip threshold | Review clip results before deleting |
-| **MPEG-PS/TS containers** | fpcalc may fail on `.mpg`, `.vob`, `.ts` with certain codecs | Install ffmpeg for automatic fallback |
+| **Some containers** | fpcalc may fail on certain files (unusual codecs, corrupt headers) | Install ffmpeg for automatic fallback |
 
 Best for: movies, TV episodes, music, lectures, podcasts. Use caution with TikTok/meme folders or stock footage libraries where many videos share the same background music.
 
@@ -212,7 +218,7 @@ Best for: movies, TV episodes, music, lectures, podcasts. Use caution with TikTo
 |---|---|---|
 | CPU | Intel 13700K (24 threads) | 18 comparison workers (75%) |
 | RAM | 64 GB DDR5 | ~500 MB fingerprint data for 3000 files |
-| Storage | 4.44 TB NAS via Gigabit Ethernet | 4-6 extraction workers saturates link |
+| Storage | 5.04 TB NAS via Gigabit Ethernet | 4-6 extraction workers saturates link |
 | GPU | Intel Arc A770 | Not used — audio fingerprinting is CPU-only |
 
 Minimum: 2-core CPU, 8 GB RAM. Worker counts auto-scale to your hardware.
@@ -225,16 +231,18 @@ Minimum: 2-core CPU, 8 GB RAM. Worker counts auto-scale to your hardware.
 |---|---|---|
 | `fpcalc.exe not found` | Missing binary | Download from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) |
 | Mass `exit code 1` with empty stderr | Timeout on large files over NAS | `--clear-failed --timeout 900` |
-| `.mpg`/`.vob`/`.ts` files failing | Container not supported by fpcalc | Install ffmpeg for automatic fallback |
-| `.ts` files failing with brackets in name | Brackets `[]` in filename | Safe-path fallback handles this automatically |
+| Files failing with fpcalc errors | Container or codec not supported | Install ffmpeg for automatic fallback |
+| Files with `#`, `[]`, `{}`, `%` in name | Special chars confuse fpcalc | Safe-path fallback handles this automatically |
 | `Another instance is already running` | Multiple VCD processes | Close other instance, or wait for it to finish |
 | `database is locked` | Stale lock file after crash | Delete `.vcd_instance.lock` in script directory |
 | PowerShell "scripts disabled" error | Execution policy blocking | Use `RUN_DELETIONS.bat` instead |
 | False positives (shared music) | Audio-only limitation | Size-warning flag auto-comments these in scripts |
 | Stuck at Phase 3 start | Serializing arrays to temp file | Normal for large libraries, wait ~10s |
 | Stuck at "Computing content keys" | NAS latency on many files | Normal — reads 192KB per file |
-| Long paths failing (>260 chars) | Deep NAS folder structure | Handled automatically via Windows extended-length paths |
+| Long paths failing (>260 chars) | Deep NAS folder structure | Handled automatically via extended-length paths |
 | UNC paths not opening from HTML | Browser security restriction | Works in Chrome/Edge; some browsers block `file://` URLs |
+| Cache DB very large | Orphaned data from deleted files | Use `--cleanup-cache` or option 5 in interactive menu |
+| Phase 3 ETA jumps around | Normal for batch-based processing | ETA is smoothed — let it stabilize over a few minutes |
 
 ---
 
