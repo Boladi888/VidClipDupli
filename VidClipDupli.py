@@ -1424,7 +1424,7 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 
 <div style="max-width:500px;margin:25px auto 5px;padding:12px 16px;background:#16213e;border-radius:8px;border:1px solid #333;font-size:12px;color:#aaa;text-align:center;">
 Use the button below to download a script with <b>your exact choices</b>.<br>
-The static RUN_DELETIONS.bat in the results folder uses the default recommendations, not your custom selections.
+Use RUN_CUSTOM_ACTIONS.bat to run your custom script. Save the downloaded .ps1 into the results folder first.
 </div>
 
 <button class="generate" onclick="generateScript()">Download Custom PowerShell Script</button>
@@ -1482,10 +1482,10 @@ function init() {{
   if (DATA.clips.length > 0) {{
     cc.innerHTML = '<div class="section-title">Redundant Clips (' + DATA.clips.length + ')</div>';
     DATA.clips.forEach((c, ci) => {{
+      const parent = c.parents[0] || {{}};
       // State: keep='clip' or 'parent', rename_to=null/filename, action='decided'/'skipped'
       clipState[ci] = {{ keep: 'parent', rename_to: null, custom_name: null, target_dir: (parent.dir || ''), action: 'decided' }};
       
-      const parent = c.parents[0] || {{}};
       const parentPathEsc = pathEsc(parent.path || '');
       const childPathEsc = pathEsc(c.child_path);
       
@@ -2018,7 +2018,7 @@ def main():
 
     cache.validate_params(config)
 
-    print(f"\n⚙️  Settings:")
+    print(f"\n⚙️ Settings:")
     print(f"   Extraction workers:  {config.max_workers}")
     print(f"   Comparison workers:  {config.comparison_workers}")
     print(f"   Clip threshold:      {config.clip_match_ratio:.0%}")
@@ -2638,13 +2638,20 @@ def main():
         f.write('Write-Host "Done!" -ForegroundColor Green\n')
 
     # PowerShell launcher — bypasses ExecutionPolicy without requiring system changes
-    with open(os.path.join(results_dir, 'RUN_DELETIONS.bat'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(results_dir, 'RUN_CUSTOM_ACTIONS.bat'), 'w', encoding='utf-8') as f:
         f.write('@echo off\n')
         f.write('chcp 65001 > nul\n')
-        f.write('echo This will run the PowerShell deletion script.\n')
-        f.write('echo If you see a red "scripts disabled" error, use this launcher instead.\n')
+        f.write('echo This will run your custom PowerShell script (custom_actions.ps1).\n')
+        f.write('echo Save the downloaded .ps1 from the HTML report into this folder first.\n')
+        f.write('echo.\n')
+        f.write('if not exist "%~dp0custom_actions.ps1" (\n')
+        f.write('    echo ERROR: custom_actions.ps1 not found in this folder.\n')
+        f.write('    echo Download it from review_results.html first, then save it here.\n')
+        f.write('    pause\n')
+        f.write('    exit /b 1\n')
+        f.write(')\n')
         f.write('pause\n')
-        f.write('PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0delete_duplicates.ps1"\n')
+        f.write('PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0custom_actions.ps1"\n')
         f.write('pause\n')
 
     # Interactive HTML report
@@ -2655,7 +2662,7 @@ def main():
     print("   - duplicate_report.json")
     print("   - delete_duplicates.bat   (cmd.exe)")
     print("   - delete_duplicates.ps1   (PowerShell — handles long paths)")
-    print("   - RUN_DELETIONS.bat       (launches PowerShell with bypass)")
+    print("   - RUN_CUSTOM_ACTIONS.bat  (launches custom .ps1 with bypass)")
     if _debug_logger and _debug_logger.handlers:
         print("   - fpcalc_debug.log        (anonymized failure details)")
     print(f"\n   Total: {total_delete} files, {format_size(total_savings)} savings")

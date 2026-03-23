@@ -8,7 +8,7 @@ It finds two things:
 1. **Exact Duplicates** — The same content in different formats (e.g., a 1080p `.mkv` and a 4K `.mp4` of the same movie).
 2. **Clips** — A shorter file whose audio lives inside a longer file (e.g., a trailer sitting next to the full movie, or a scene rip from a longer compilation).
 
-> **⚠️ Safe by design.** This script **never deletes files**. It generates an interactive HTML report where you review every match and choose what to keep, delete, or rename — then exports a custom PowerShell script with your exact choices.
+> **⚠️ Safe by design.** This script **never deletes files**. It generates an interactive HTML report where you review every match and choose what to keep, delete, rename, or move — then exports a custom PowerShell script with your exact choices.
 
 ---
 
@@ -43,8 +43,8 @@ Phase 0: Scan        Find all media files in target directories
 Phase 0.5: Hash      Compute content keys (quick_hash) for cache lookup
 Phase 1: Extract     fpcalc decodes the full audio stream → uint32 fingerprint array
                      (ffmpeg fallback for any fpcalc failure if available)
-Phase 2: Cache       Look up previously computed comparisons in SQLite
-Phase 3: Compare     Sliding-window XOR + popcount across all pairs (multi-core)
+Phase 2: Pre-filter  Skip pairs that can never pass the intro filter, then cache lookup
+Phase 3: Compare     Sliding-window XOR + popcount across remaining pairs (multi-core)
 Phase 4: Group       Union-Find for duplicates, directed edges for clips
 Output:              HTML report + .bat + .ps1 + .json
 ```
@@ -57,6 +57,10 @@ Output:              HTML report + .bat + .ps1 + .json
 
 **Threshold Re-evaluation** stores raw comparison metrics (match_ratio, length_ratio, matched_seconds) — not boolean results. You can change `--clip-ratio` or `--dup-ratio` between runs and cached metrics are re-evaluated against the new thresholds instantly, without re-extracting or re-comparing.
 
+**Pre-filtering** — Before any comparisons run, pairs where the shorter file's audio is too short to ever pass the intro filter are skipped entirely. This can eliminate millions of unnecessary comparisons in libraries with many short clips alongside long movies.
+
+**Graceful interruption** — Press Ctrl+C during any phase to stop gracefully. VCD saves all progress to cache and generates a partial HTML report with whatever matches were found so far. Run again to continue where you left off.
+
 ---
 
 ## Interactive HTML Report
@@ -68,15 +72,16 @@ The star feature. Open `review_results.html` in any browser:
 - **Open** button for quick preview of any file
 - **Keep** / **Delete** / **Use Name** buttons on every file
 - "Use Name" shows an **editable text field** — type any custom filename
-- **Folder selector** appears when files are in different directories — choose where the renamed file goes
+- **Folder selector** appears when files are in different directories — choose where the kept file goes (with or without a rename)
 - **Skip** button to leave a group untouched
-- Live counters for deletions, renames, and skips
-- Redundant clips shown as parent/child pairs with the same interactive controls
+- Live counters for deletions, renames/moves, and skips
+- Redundant clips shown as parent/child pairs with the same interactive controls (including folder selection)
 - Big **Download Custom PowerShell Script** button at the bottom
+- **Partial results banner** if the scan was interrupted — shows what was found so far
 
 The generated `.ps1` contains only the actions you chose — `Remove-Item` for deletions, `Rename-Item` for same-directory renames, `Move-Item` for cross-directory moves. No surprises.
 
-> **Note:** The static `RUN_DELETIONS.bat` in the results folder uses the default recommendations. For your custom choices, use the downloaded script from the HTML report.
+> **Note:** The static `delete_duplicates.ps1` in the results folder uses default recommendations. For your custom choices, download the script from the HTML report, save it into the results folder, and use `RUN_CUSTOM_ACTIONS.bat` to launch it.
 
 ---
 
@@ -88,13 +93,13 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 ├── duplicate_report.json      Full structured data
 ├── delete_duplicates.bat      cmd.exe script (basic)
 ├── delete_duplicates.ps1      PowerShell script (handles long paths + Unicode)
-├── RUN_DELETIONS.bat          Launches PowerShell with ExecutionPolicy bypass
+├── RUN_CUSTOM_ACTIONS.bat      Launches your custom .ps1 with ExecutionPolicy bypass
 └── fpcalc_debug.log           Anonymized failure log (if errors occurred)
 ```
 
 **Which script should I use?**
 - **review_results.html** — Recommended. Review interactively, then download a custom PowerShell script with your exact choices.
-- **RUN_DELETIONS.bat** — Quick option. Double-click to run the default deletion recommendations without interactive review.
+- **RUN_CUSTOM_ACTIONS.bat** — After downloading `custom_actions.ps1` from the HTML report, save it into the results folder and double-click this to run it. Handles ExecutionPolicy automatically.
 - **delete_duplicates.ps1** — The default deletion script. Use directly if you've already enabled PowerShell scripts.
 - **delete_duplicates.bat** — Fallback for cmd.exe. Has 260-character path limit on older Windows.
 
@@ -109,7 +114,7 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 | `-c`, `--compare-workers` | 75% CPUs | Comparison workers. These pin your CPU hard. |
 | `--clip-ratio` | `0.75` | Min match ratio for clips (0.0–1.0). Lower = more lenient. |
 | `--dup-ratio` | `0.95` | Min match ratio for exact duplicates (0.0–1.0). |
-| `--intro-filter` | `30` | Ignore matches shorter than N seconds of audio. Filters shared studio logos. |
+| `--intro-filter` | `30` | Ignore matches shorter than N seconds of audio. Filters shared studio logos. Also controls the pre-filter that skips impossible pairs before comparison. |
 | `--timeout` | `600` | Per-file timeout in seconds. Increase for large files on NAS. |
 | `--clear-cache` | — | Wipe all cached data and start fresh. |
 | `--clear-comparisons` | — | Wipe comparisons only (keeps fingerprints). Use when changing thresholds. |
@@ -184,6 +189,18 @@ The three-point sampling (start, middle, end) prevents collisions between same-s
 
 ---
 
+## Ctrl+C and Partial Results
+
+You can press Ctrl+C at any point during scanning, extraction, or comparison. VCD will:
+
+1. **Save all progress** — Fingerprints and comparisons computed so far are committed to the SQLite cache. Nothing is lost.
+2. **Generate a partial report** — The HTML report, JSON, and scripts are generated with whatever matches were found up to that point. The HTML shows a prominent warning banner indicating results are incomplete.
+3. **Resume on next run** — Cached fingerprints and comparisons are reused automatically. Only the remaining uncached pairs need computing.
+
+Press Ctrl+C once for graceful shutdown, twice to force quit (kills all worker processes immediately).
+
+---
+
 ## Unicode & Special Characters
 
 VCD handles filenames with Chinese, Japanese, Korean, emoji, brackets, `#`, `%`, `&`, and other special characters through a multi-step fallback chain:
@@ -196,6 +213,8 @@ VCD handles filenames with Chinese, Japanese, Korean, emoji, brackets, `#`, `%`,
 
 No files are ever copied. The entire chain is zero-copy.
 
+Filenames with `#`, `%`, and `?` are URL-encoded in the HTML report so clickable file links work correctly in all browsers.
+
 ---
 
 ## Limitations
@@ -207,6 +226,7 @@ No files are ever copied. The entire chain is zero-copy.
 | **Content-based cache** | Editing a file (even just metadata) may trigger re-extraction | Only if first/middle/last 64KB or size changes |
 | **Time-agnostic matching** | Compilations with scattered fragments may hit clip threshold | Review clip results before deleting |
 | **Some containers** | fpcalc may fail on certain files (unusual codecs, corrupt headers) | Install ffmpeg for automatic fallback |
+| **Pre-filter and intro filter** | Pairs where the shorter file is too short to pass the intro filter are skipped without caching | Running later with `--intro-filter 0` will compute these fresh |
 
 Best for: movies, TV episodes, music, lectures, podcasts. Use caution with TikTok/meme folders or stock footage libraries where many videos share the same background music.
 
@@ -235,7 +255,7 @@ Minimum: 2-core CPU, 8 GB RAM. Worker counts auto-scale to your hardware.
 | Files with `#`, `[]`, `{}`, `%` in name | Special chars confuse fpcalc | Safe-path fallback handles this automatically |
 | `Another instance is already running` | Multiple VCD processes | Close other instance, or wait for it to finish |
 | `database is locked` | Stale lock file after crash | Delete `.vcd_instance.lock` in script directory |
-| PowerShell "scripts disabled" error | Execution policy blocking | Use `RUN_DELETIONS.bat` instead |
+| PowerShell "scripts disabled" error | Execution policy blocking | Use `RUN_CUSTOM_ACTIONS.bat` instead |
 | False positives (shared music) | Audio-only limitation | Size-warning flag auto-comments these in scripts |
 | Stuck at Phase 3 start | Serializing arrays to temp file | Normal for large libraries, wait ~10s |
 | Stuck at "Computing content keys" | NAS latency on many files | Normal — reads 192KB per file |
@@ -243,6 +263,7 @@ Minimum: 2-core CPU, 8 GB RAM. Worker counts auto-scale to your hardware.
 | UNC paths not opening from HTML | Browser security restriction | Works in Chrome/Edge; some browsers block `file://` URLs |
 | Cache DB very large | Orphaned data from deleted files | Use `--cleanup-cache` or option 5 in interactive menu |
 | Phase 3 ETA jumps around | Normal for batch-based processing | ETA is smoothed — let it stabilize over a few minutes |
+| Phase 3 shows CLIP not DUP | Files match 100% but differ in length | Correct — shorter audio is fully inside the longer file. DUP requires same length (±10%). |
 
 ---
 
