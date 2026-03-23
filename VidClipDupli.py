@@ -1287,7 +1287,7 @@ def compare_batch(batch: List[Tuple[str, str]], config: Config):
 # HTML INTERACTIVE REPORT
 # ============================================================================
 
-def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints, display_root, total_delete, total_savings):
+def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints, display_root, total_delete, total_savings, partial=False):
     """Generate an interactive HTML report for reviewing duplicates."""
     html_path = os.path.join(results_dir, 'review_results.html')
 
@@ -1406,10 +1406,11 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 <body>
 <h1>VidClipDuplis — Review Results</h1>
 <p class="subtitle">Click files to set actions. Then generate a custom PowerShell script.</p>
+{'<div style="background:#e9a045;color:#000;padding:12px 20px;border-radius:8px;margin-bottom:20px;font-weight:bold;">⚠️ PARTIAL RESULTS — Scan was interrupted (Ctrl+C). Not all comparisons were completed. Run again to get full results. Matches shown are from cached + computed comparisons so far.</div>' if partial else ''}
 
 <div class="summary">
  <div class="stat"><div class="num" id="del-count">0</div><div class="label">Files to Delete</div></div>
- <div class="stat"><div class="num" id="rename-count">0</div><div class="label">Files to Rename</div></div>
+ <div class="stat"><div class="num" id="rename-count">0</div><div class="label">Renames / Moves</div></div>
  <div class="stat"><div class="num" id="skip-count">0</div><div class="label">Groups Skipped</div></div>
  <div class="stat"><div class="num">{format_size(total_savings)}</div><div class="label">Max Potential Savings</div></div>
 </div>
@@ -1445,7 +1446,8 @@ function init() {{
 
   DATA.groups.forEach((g, gi) => {{
     const keepIdx = g.files.findIndex(f => f.is_keep);
-    state[gi] = {{ keep: keepIdx >= 0 ? keepIdx : 0, rename_from: null, custom_name: null, target_dir: null, action: 'decided' }};
+    const ki = keepIdx >= 0 ? keepIdx : 0;
+    state[gi] = {{ keep: ki, rename_from: null, custom_name: null, target_dir: g.files[ki].dir, action: 'decided' }};
 
     let warn = g.size_warning ? ' warning' : (g.identical ? ' identical' : '');
     let badges = '';
@@ -1481,7 +1483,7 @@ function init() {{
     cc.innerHTML = '<div class="section-title">Redundant Clips (' + DATA.clips.length + ')</div>';
     DATA.clips.forEach((c, ci) => {{
       // State: keep='clip' or 'parent', rename_to=null/filename, action='decided'/'skipped'
-      clipState[ci] = {{ keep: 'parent', rename_to: null, custom_name: null, action: 'decided' }};
+      clipState[ci] = {{ keep: 'parent', rename_to: null, custom_name: null, target_dir: (parent.dir || ''), action: 'decided' }};
       
       const parent = c.parents[0] || {{}};
       const parentPathEsc = pathEsc(parent.path || '');
@@ -1542,7 +1544,9 @@ function pathEsc(p) {{
 
 function toFileUrl(path) {{
   // Convert Windows path to file:// URL
-  const p = path.replace(/\\\\/g, '/');
+  let p = path.replace(/\\\\/g, '/');
+  // Encode chars that have special meaning in URLs (% first to avoid double-encoding)
+  p = p.replace(/%/g, '%25').replace(/#/g, '%23').replace(/\\?/g, '%3F');
   if (p.startsWith('//')) {{
     // UNC path: \\\\server\\share → file://server/share (RFC 8089)
     return 'file:' + p;
@@ -1564,14 +1568,16 @@ function openFolder(path) {{
 function setKeep(gi, fi) {{
   state[gi].keep = fi;
   state[gi].rename_from = null;
+  state[gi].target_dir = DATA.groups[gi].files[fi].dir;
   state[gi].action = 'decided';
   updateGroupRows(gi);
   updateCounters();
 }}
 
 function setDelete(gi, fi) {{
-  const otherIdx = DATA.groups[gi].files.findIndex((_, i) => i !== fi);
-  if (otherIdx >= 0) {{ state[gi].keep = otherIdx; }}
+  const g = DATA.groups[gi];
+  const otherIdx = g.files.findIndex((_, i) => i !== fi);
+  if (otherIdx >= 0) {{ state[gi].keep = otherIdx; state[gi].target_dir = g.files[otherIdx].dir; }}
   state[gi].rename_from = null;
   state[gi].action = 'decided';
   updateGroupRows(gi);
@@ -1582,7 +1588,6 @@ function setRename(gi, fi) {{
   if (state[gi].keep === fi) {{ return; }}
   state[gi].rename_from = fi;
   state[gi].custom_name = DATA.groups[gi].files[fi].filename;
-  state[gi].target_dir = DATA.groups[gi].files[state[gi].keep].dir;
   state[gi].action = 'decided';
   updateGroupRows(gi);
   updateCounters();
@@ -1595,8 +1600,10 @@ function setSkip(gi) {{
 }}
 
 function setClipKeep(ci, which) {{
+  const c = DATA.clips[ci];
   clipState[ci].keep = which;
   clipState[ci].rename_to = null;
+  clipState[ci].target_dir = which === 'parent' ? (c.parents[0] ? c.parents[0].dir : '') : c.child_dir;
   clipState[ci].action = 'decided';
   updateClipRows(ci);
   updateCounters();
@@ -1632,38 +1639,61 @@ function updateClipRows(ci) {{
   parentRename.innerHTML = '';
   clipRename.innerHTML = '';
   
+  const pdir = c.parents[0] ? c.parents[0].dir : '';
+  const hasDiffDirs = pdir && c.child_dir && pdir !== c.child_dir;
+  const cdirs = hasDiffDirs ? [pdir, c.child_dir] : [];
+  
   if (clipState[ci].action === 'skipped') {{
     parentRow.className = 'file-row selected-skip';
     clipRow.className = 'file-row selected-skip';
   }} else if (clipState[ci].keep === 'parent') {{
     parentRow.className = 'file-row selected-keep';
     clipRow.className = 'file-row selected-delete';
+    let rhtml = '';
     if (clipState[ci].rename_to === 'clip') {{
       const curName = clipState[ci].custom_name || c.child_name;
-      let rhtml = '<span style="color:#b388ff">Rename to: </span>';
+      rhtml += '<span style="color:#b388ff">Rename to: </span>';
       rhtml += '<input type="text" class="rename-input" value="' + escHtml(curName) + '" '
         + 'onchange="clipState[' + ci + '].custom_name = this.value" '
         + 'onclick="event.stopPropagation()" />';
-      parentRename.innerHTML = rhtml;
-      parentRename.style.display = 'block';
     }}
+    if (hasDiffDirs) {{
+      rhtml += (rhtml ? '<br>' : '') + '<span style="color:#b388ff;font-size:11px">Save in: </span>';
+      rhtml += '<select class="dir-select" onchange="clipState[' + ci + '].target_dir = this.value" onclick="event.stopPropagation()">';
+      cdirs.forEach(d => {{
+        const sel = d === (clipState[ci].target_dir || pdir) ? ' selected' : '';
+        rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
+      }});
+      rhtml += '</select>';
+    }}
+    if (rhtml) {{ parentRename.innerHTML = rhtml; parentRename.style.display = 'block'; }}
   }} else {{
     clipRow.className = 'file-row selected-keep';
     parentRow.className = 'file-row selected-delete';
+    let rhtml = '';
     if (clipState[ci].rename_to === 'parent') {{
       const pname = clipState[ci].custom_name || (c.parents[0] ? c.parents[0].name : '');
-      let rhtml = '<span style="color:#b388ff">Rename to: </span>';
+      rhtml += '<span style="color:#b388ff">Rename to: </span>';
       rhtml += '<input type="text" class="rename-input" value="' + escHtml(pname) + '" '
         + 'onchange="clipState[' + ci + '].custom_name = this.value" '
         + 'onclick="event.stopPropagation()" />';
-      clipRename.innerHTML = rhtml;
-      clipRename.style.display = 'block';
     }}
+    if (hasDiffDirs) {{
+      rhtml += (rhtml ? '<br>' : '') + '<span style="color:#b388ff;font-size:11px">Save in: </span>';
+      rhtml += '<select class="dir-select" onchange="clipState[' + ci + '].target_dir = this.value" onclick="event.stopPropagation()">';
+      cdirs.forEach(d => {{
+        const sel = d === (clipState[ci].target_dir || c.child_dir) ? ' selected' : '';
+        rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
+      }});
+      rhtml += '</select>';
+    }}
+    if (rhtml) {{ clipRename.innerHTML = rhtml; clipRename.style.display = 'block'; }}
   }}
 }}
 
 function updateGroupRows(gi) {{
   const g = DATA.groups[gi];
+  const dirs = [...new Set(g.files.map(x => x.dir))];
   g.files.forEach((f, fi) => {{
     const row = document.getElementById('row-' + gi + '-' + fi);
     const renameInfo = document.getElementById('rename-info-' + gi + '-' + fi);
@@ -1675,23 +1705,24 @@ function updateGroupRows(gi) {{
       row.className = 'file-row selected-skip';
     }} else if (fi === state[gi].keep) {{
       row.className = 'file-row selected-keep';
+      let rhtml = '';
       if (state[gi].rename_from !== null) {{
         const curName = state[gi].custom_name || g.files[state[gi].rename_from].filename;
-        let rhtml = '<span style="color:#b388ff">Rename to: </span>';
+        rhtml += '<span style="color:#b388ff">Rename to: </span>';
         rhtml += '<input type="text" class="rename-input" value="' + escHtml(curName) + '" '
           + 'onchange="state[' + gi + '].custom_name = this.value" '
           + 'onclick="event.stopPropagation()" />';
-        // Folder picker if files are in different directories
-        const dirs = [...new Set(g.files.map(x => x.dir))];
-        if (dirs.length > 1) {{
-          rhtml += '<br><span style="color:#b388ff;font-size:11px">Save in: </span>';
-          rhtml += '<select class="dir-select" onchange="state[' + gi + '].target_dir = this.value" onclick="event.stopPropagation()">';
-          dirs.forEach(d => {{
-            const sel = d === (state[gi].target_dir || f.dir) ? ' selected' : '';
-            rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
-          }});
-          rhtml += '</select>';
-        }}
+      }}
+      if (dirs.length > 1) {{
+        rhtml += (rhtml ? '<br>' : '') + '<span style="color:#b388ff;font-size:11px">Save in: </span>';
+        rhtml += '<select class="dir-select" onchange="state[' + gi + '].target_dir = this.value" onclick="event.stopPropagation()">';
+        dirs.forEach(d => {{
+          const sel = d === (state[gi].target_dir || f.dir) ? ' selected' : '';
+          rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
+        }});
+        rhtml += '</select>';
+      }}
+      if (rhtml) {{
         renameInfo.innerHTML = rhtml;
         renameInfo.style.display = 'block';
       }}
@@ -1707,20 +1738,22 @@ function updateAllRows() {{
 }}
 
 function updateCounters() {{
-  let dels = 0, renames = 0, skips = 0;
+  let dels = 0, changes = 0, skips = 0;
   DATA.groups.forEach((g, gi) => {{
     if (state[gi].action === 'skipped') {{ skips++; return; }}
     dels += g.files.length - 1;
-    if (state[gi].rename_from !== null) renames++;
+    const kf = g.files[state[gi].keep];
+    if (state[gi].rename_from !== null || (state[gi].target_dir && state[gi].target_dir !== kf.dir)) changes++;
   }});
   DATA.clips.forEach((c, ci) => {{
     const cs = clipState[ci];
     if (cs.action === 'skipped') {{ skips++; return; }}
     dels++;
-    if (cs.rename_to !== null) renames++;
+    const kdir = cs.keep === 'parent' ? (c.parents[0] ? c.parents[0].dir : '') : c.child_dir;
+    if (cs.rename_to !== null || (cs.target_dir && cs.target_dir !== kdir)) changes++;
   }});
   document.getElementById('del-count').textContent = dels;
-  document.getElementById('rename-count').textContent = renames;
+  document.getElementById('rename-count').textContent = changes;
   document.getElementById('skip-count').textContent = skips;
   document.getElementById('reviewed').textContent = Object.values(state).filter(s => s.action !== undefined).length;
 }}
@@ -1750,17 +1783,19 @@ function generateScript() {{
     }});
 
     if (state[gi].rename_from !== null) {{
-      const newName = (state[gi].custom_name || g.files[state[gi].rename_from].filename).replace(/'/g, "''");
-      const oldP = keepFile.path.replace(/'/g, "''");
+      const newName = (state[gi].custom_name || g.files[state[gi].rename_from].filename);
       const targetDir = state[gi].target_dir || keepFile.dir;
-      
       if (targetDir !== keepFile.dir) {{
-        // Different directory — move + rename in one step
-        const dest = (targetDir + '\\\\' + (state[gi].custom_name || g.files[state[gi].rename_from].filename)).replace(/'/g, "''");
-        lines.push("Move-Item -LiteralPath '" + oldP + "' -Destination '" + dest + "' -Force");
-      }} else {{
-        // Same directory — just rename
-        lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newName + "'");
+        const dest = (targetDir + '\\\\' + newName).replace(/'/g, "''");
+        lines.push("Move-Item -LiteralPath '" + keepFile.path.replace(/'/g, "''") + "' -Destination '" + dest + "' -Force");
+      }} else if (newName !== keepFile.filename) {{
+        lines.push("Rename-Item -LiteralPath '" + keepFile.path.replace(/'/g, "''") + "' -NewName '" + newName.replace(/'/g, "''") + "'");
+      }}
+    }} else {{
+      const targetDir = state[gi].target_dir || keepFile.dir;
+      if (targetDir !== keepFile.dir) {{
+        const dest = (targetDir + '\\\\' + keepFile.filename).replace(/'/g, "''");
+        lines.push("Move-Item -LiteralPath '" + keepFile.path.replace(/'/g, "''") + "' -Destination '" + dest + "' -Force");
       }}
     }}
     lines.push('');
@@ -1774,29 +1809,34 @@ function generateScript() {{
     if (!hasClips) {{ lines.push('# Redundant clips'); hasClips = true; }}
     
     const parent = c.parents[0] || {{}};
+    let keptPath, keptDir, keptName, deletePath;
     
     if (cs.keep === 'parent') {{
-      // Delete clip, keep parent
-      const p = c.child_path.replace(/'/g, "''");
-      lines.push("Remove-Item -LiteralPath '" + p + "' -Force");
-      if (cs.rename_to === 'clip') {{
-        // Rename parent to clip's name (or custom name)
-        const oldP = parent.path.replace(/'/g, "''");
-        const newName = (cs.custom_name || c.child_name).replace(/'/g, "''");
-        lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newName + "'");
-      }}
+      deletePath = c.child_path;
+      keptPath = parent.path || '';
+      keptDir = parent.dir || '';
+      keptName = parent.name || '';
     }} else {{
-      // Delete parent, keep clip
-      if (parent.path) {{
-        const p = parent.path.replace(/'/g, "''");
-        lines.push("Remove-Item -LiteralPath '" + p + "' -Force");
-      }}
-      if (cs.rename_to === 'parent' && (cs.custom_name || parent.name)) {{
-        // Rename clip to parent's name (or custom name)
-        const oldP = c.child_path.replace(/'/g, "''");
-        const newName = (cs.custom_name || parent.name).replace(/'/g, "''");
-        lines.push("Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newName + "'");
-      }}
+      deletePath = parent.path || '';
+      keptPath = c.child_path;
+      keptDir = c.child_dir;
+      keptName = c.child_name;
+    }}
+    
+    if (deletePath) {{
+      lines.push("Remove-Item -LiteralPath '" + deletePath.replace(/'/g, "''") + "' -Force");
+    }}
+    
+    const hasRename = cs.rename_to !== null;
+    const finalName = hasRename ? (cs.custom_name || (cs.keep === 'parent' ? c.child_name : (parent.name || ''))) : keptName;
+    const targetDir = cs.target_dir || keptDir;
+    const needsMove = targetDir !== keptDir;
+    
+    if (needsMove && keptPath) {{
+      const dest = (targetDir + '\\\\' + finalName).replace(/'/g, "''");
+      lines.push("Move-Item -LiteralPath '" + keptPath.replace(/'/g, "''") + "' -Destination '" + dest + "' -Force");
+    }} else if (hasRename && finalName !== keptName && keptPath) {{
+      lines.push("Rename-Item -LiteralPath '" + keptPath.replace(/'/g, "''") + "' -NewName '" + finalName.replace(/'/g, "''") + "'");
     }}
     lines.push('');
   }});
@@ -2170,10 +2210,6 @@ def main():
         if failed_count > 0 and _debug_logger:
             print(f"   📋 Debug log: {os.path.join(results_dir, 'fpcalc_debug.log')}")
 
-    if SHUTDOWN_REQUESTED:
-        print("\n⚠️  Progress saved. Run again to continue.")
-        return
-
     # Build hash_arrays keyed by content_key for comparison
     # Only include content_keys that have valid fingerprints
     hash_arrays = {}  # content_key -> numpy array
@@ -2212,13 +2248,31 @@ def main():
     print(f"   Comparison pairs: {total_pairs:,}")
 
     # Generate all pairs (using content_keys) for files that aren't already identical
-    all_pairs = [
-        (content_keys_for_comparison[i], content_keys_for_comparison[j]) 
-        if content_keys_for_comparison[i] <= content_keys_for_comparison[j] 
-        else (content_keys_for_comparison[j], content_keys_for_comparison[i])
-        for i in range(len(content_keys_for_comparison)) 
-        for j in range(i+1, len(content_keys_for_comparison))
-    ]
+    # Pre-filter: skip any pair where the shorter file can NEVER pass the intro filter
+    # This is safe and does NOT violate the "no early exit inside compare_audio_pair" rule
+    min_matched_seconds_needed = config.intro_filter_seconds
+    min_chunks_needed = int(min_matched_seconds_needed / (config.chunk_size / 6.0)) + 1
+    min_samples_needed = min_chunks_needed * config.chunk_size
+
+    all_pairs = []
+    skipped_by_filter = 0
+
+    for i in range(len(content_keys_for_comparison)):
+        for j in range(i + 1, len(content_keys_for_comparison)):
+            k1 = content_keys_for_comparison[i]
+            k2 = content_keys_for_comparison[j]
+            shorter_len = min(len(hash_arrays[k1]), len(hash_arrays[k2]))
+            
+            if shorter_len < min_samples_needed:
+                skipped_by_filter += 1
+                continue  # Guaranteed to fail classify_comparison
+            
+            # Keep normalized order for cache lookup
+            a, b = (k1, k2) if k1 <= k2 else (k2, k1)
+            all_pairs.append((a, b))
+
+    print(f"   Pre-filtered: {skipped_by_filter:,} impossible pairs (shorter than intro filter)")
+    print(f"   Remaining pairs to evaluate: {len(all_pairs):,}")
 
     # Phase 2: Cache lookup
     dup_matches = list(dup_matches_identical)  # Start with identical file matches
@@ -2305,7 +2359,14 @@ def main():
                                     for pt1 in paths1:
                                         for pt2 in paths2:
                                             clip_matches.append((pt1[0], pt2[0], mr))
-                                    tqdm.write(f"   📎 CLIP ({mr*100:.1f}%): {os.path.basename(paths1[0][0])} ↔ {os.path.basename(paths2[0][0])}")
+                                    # Show direction: which is clip (shorter) vs parent (longer)
+                                    l1 = len(hash_arrays.get(k1, []))
+                                    l2 = len(hash_arrays.get(k2, []))
+                                    if l1 <= l2:
+                                        cname, pname = os.path.basename(paths1[0][0]), os.path.basename(paths2[0][0])
+                                    else:
+                                        cname, pname = os.path.basename(paths2[0][0]), os.path.basename(paths1[0][0])
+                                    tqdm.write(f"   📎 CLIP ({mr*100:.1f}%): {cname} ⊂ {pname}")
                         pbar.update(future_to_size[future])
                         if len(batch_buf) >= 5000:
                             cache.batch_set_comparisons(batch_buf)
@@ -2321,9 +2382,7 @@ def main():
         finally:
             cleanup_arrays_file()
 
-    if SHUTDOWN_REQUESTED:
-        print("\n⚠️  Progress saved. Run again to continue.")
-        return
+    partial_results = SHUTDOWN_REQUESTED
 
     print(f"\n✓ {len(dup_matches)+len(clip_matches)} matches ({len(dup_matches)} dups, {len(clip_matches)} clips)")
     if len(dup_matches_identical) > 0:
@@ -2420,13 +2479,23 @@ def main():
     # Output
     display_root = root_dirs[0]
     print("\n" + "=" * 60)
-    print("  RESULTS")
+    if partial_results:
+        print("  PARTIAL RESULTS (interrupted)")
+    else:
+        print("  RESULTS")
     print("=" * 60)
     print("\n   ℹ️  Audio-only matching. Videos with the same background")
     print("   music will match. Review results before deleting.")
+    if partial_results:
+        print("\n   ⚠️  Scan was interrupted — results are incomplete.")
+        print("   Run again to compare remaining pairs. Cached progress is preserved.")
 
     if not dup_groups and not clip_deletions:
-        print("\n✨ No duplicates or clips found!")
+        if partial_results:
+            print("\n⏳ No matches found yet in partial scan.")
+            print("   Run again to continue comparing — cached progress is preserved.")
+        else:
+            print("\n✨ No duplicates or clips found!")
         return
 
     if dup_groups:
@@ -2483,7 +2552,8 @@ def main():
             'fingerprinted': len(path_fingerprints),
             'failed': cache.get_failed_count(), 
             'scan_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'config': {k: getattr(config, k) for k in ['clip_match_ratio', 'duplicate_match_ratio', 'intro_filter_seconds', 'match_threshold', 'chunk_size']}
+            'config': {k: getattr(config, k) for k in ['clip_match_ratio', 'duplicate_match_ratio', 'intro_filter_seconds', 'match_threshold', 'chunk_size']},
+            'partial': partial_results
         },
         'summary': {
             'duplicate_groups': len(dup_groups), 
@@ -2578,7 +2648,7 @@ def main():
         f.write('pause\n')
 
     # Interactive HTML report
-    _generate_html_report(results_dir, dup_groups, clip_deletions, path_fingerprints, display_root, total_delete, total_savings)
+    _generate_html_report(results_dir, dup_groups, clip_deletions, path_fingerprints, display_root, total_delete, total_savings, partial=partial_results)
 
     print(f"\n📄 Results saved to: {results_dir}")
     print("   - review_results.html     (interactive — open in browser)")
@@ -2589,7 +2659,11 @@ def main():
     if _debug_logger and _debug_logger.handlers:
         print("   - fpcalc_debug.log        (anonymized failure details)")
     print(f"\n   Total: {total_delete} files, {format_size(total_savings)} savings")
-    print("\n✨ Done! Open review_results.html in your browser to review.")
+    if partial_results:
+        print("\n⚠️  PARTIAL RESULTS — scan was interrupted. Run again to continue.")
+        print("   Cached progress is preserved. Open review_results.html to see matches found so far.")
+    else:
+        print("\n✨ Done! Open review_results.html in your browser to review.")
 
 if __name__ == '__main__':
     main()
