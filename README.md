@@ -67,16 +67,21 @@ Output:              HTML report + .bat + .ps1 + .json
 
 The star feature. Open `review_results.html` in any browser:
 
-- Each duplicate group is a card showing every file with size, duration, and full path
+- **All groups default to Skip** — nothing happens unless you explicitly decide. This prevents accidental deletions.
+- **Collapsible cards** — each group shows a one-line summary (group number, file count, recommended keep filename). Click to expand and see all files + action buttons. Use "Expand All" / "Collapse All" buttons for quick navigation.
+- **Summary line updates live** — when you make a choice, the collapsed header shows your decision: "Delete 2 · Keep: movie.mkv → T:\Movies\Action"
+- **★ Recommended keep** badge on each group header shows which file the script recommends keeping (largest file by size)
 - **Clickable filenames** open the file directly; **clickable folder paths** open the containing directory
 - **Open** button for quick preview of any file
 - **Keep** / **Delete** / **Use Name** buttons on every file
 - "Use Name" shows an **editable text field** — type any custom filename
 - **Folder selector** appears when files are in different directories — choose where the kept file goes (with or without a rename)
 - **Skip** button to leave a group untouched
-- Live counters for deletions, renames/moves, and skips
+- Live counters for actions, deletions, renames/moves, and skips
 - Redundant clips shown as parent/child pairs with the same interactive controls (including folder selection)
-- Big **Download Custom PowerShell Script** button at the bottom
+- **Previously skipped groups** are hidden by default. Toggle "Show previously skipped (N)" to reveal them. These appear in a separate section with muted styling.
+- **Download Custom PowerShell Script** button shows action count. Generates `.ps1` with only your chosen actions.
+- **Save Dismissed Groups** button exports `vcd_dismissed.json` — save it next to VidClipDupli.py and skipped groups will be hidden on the next run.
 - **Partial results banner** if the scan was interrupted — shows what was found so far
 
 The generated `.ps1` contains only the actions you chose — `Remove-Item` for deletions, `Rename-Item` for same-directory renames, `Move-Item` for cross-directory moves. No surprises.
@@ -120,6 +125,7 @@ The generated `.ps1` contains only the actions you chose — `Remove-Item` for d
 | `--clear-comparisons` | — | Wipe comparisons only (keeps fingerprints). Use when changing thresholds. |
 | `--clear-failed` | — | Retry previously failed files. |
 | `--cleanup-cache` | — | Remove cached data for files no longer in scanned directories and shrink DB. |
+| `--clear-dismissed` | — | Re-show previously skipped groups in the HTML report. |
 | `--no-prompt` | — | Skip interactive setup, use all defaults. |
 
 ---
@@ -184,8 +190,26 @@ The three-point sampling (start, middle, end) prevents collisions between same-s
 - `comparisons` — key1, key2, match_ratio, length_ratio, matched_seconds
 - `failed_files` — content_key, last_path, reason
 - `cache_params` — tracks algorithm version and comparison params; auto-clears stale data on upgrades
+- `dismissed_pairs` — content_key pairs the user explicitly skipped in the HTML report
 
 **Cache cleanup:** Use `--cleanup-cache` or option 5 in the interactive menu to remove cached data for files that have been deleted from the scanned directories. This is scoped — only data for files under the directories you're currently scanning is affected. Data from other directories (scanned in previous runs) is left untouched. Cleanup is automatically skipped if any files were inaccessible during scanning to prevent false deletion of valid cache entries.
+
+---
+
+## Dismissed Groups
+
+When you skip groups in the HTML report, you can save your dismissals:
+
+1. Click **Save Dismissed Groups (vcd_dismissed.json)** in the HTML report
+2. Save the downloaded file next to `VidClipDupli.py`
+3. On the next run, VCD automatically imports it and those groups are hidden by default
+
+**How it works:** Dismissed groups are stored as content_key pairs in the SQLite cache. Since content_keys are based on file content (not paths), dismissed groups survive file moves and renames. Groups are only hidden when ALL pairs within the group have been dismissed — if a new file joins a previously-dismissed group, it will reappear.
+
+**Manage dismissed groups:**
+- In the HTML report, toggle "Show previously skipped" to reveal and optionally un-skip them
+- Use `--clear-dismissed` or option 6 in the interactive menu to reset all dismissals
+- Dismissed pairs for deleted files are cleaned up automatically with `--cleanup-cache`
 
 ---
 

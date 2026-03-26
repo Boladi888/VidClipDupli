@@ -446,9 +446,11 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Tuple[Config, bo
     fp_count = cache.get_fingerprint_count()
     cmp_count = cache.get_comparison_count()
     failed_count = cache.get_failed_count()
+    dismissed_count = cache.get_dismissed_count()
     print(f"    Fingerprints cached: {fp_count:,}")
     print(f"    Comparisons cached:  {cmp_count:,}")
     print(f"    Failed files:        {failed_count:,}")
+    print(f"    Dismissed groups:    {dismissed_count:,} pairs")
     
     print(f"\n  Cache management:")
     print(f"    1. Clear failed list     (retry files that previously failed)")
@@ -457,6 +459,7 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Tuple[Config, bo
     print(f"    4. No changes            (keep cache as-is)")
     print(f"    5. Cleanup orphans       (remove data for deleted/moved files, shrink DB)")
     print(f"       DB size: {format_size(cache.get_db_size())}")
+    print(f"    6. Clear dismissed       (re-show previously skipped groups)")
     
     cache_choice = input("\n  Cache action? [4]: ").strip()
     if cache_choice == '1':
@@ -469,9 +472,13 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Tuple[Config, bo
         cache.clear_fingerprints()
         cache.clear_comparisons()
         cache.clear_failed()
+        cache.clear_dismissed()
         print("  🗑️  All caches cleared")
     elif cache_choice == '5':
         print("  🔍 Cleanup runs after scanning (needs file list to know what's orphaned)")
+    elif cache_choice == '6':
+        cache.clear_dismissed()
+        print("  🗑️  Dismissed groups cleared — all groups will appear in next report")
 
     _cleanup_requested = cache_choice == '5'
 
@@ -481,6 +488,7 @@ def interactive_setup(cpu_count: int, cache: 'UnifiedCache') -> Tuple[Config, bo
     print(f"    --clear-comparisons      Re-compare with different thresholds")
     print(f"    --clear-cache            Wipe everything and start fresh")
     print(f"    --cleanup-cache          Remove data for deleted/moved files, shrink DB")
+    print(f"    --clear-dismissed        Re-show previously skipped groups")
     print(f"    -w 4                     Set extraction workers")
     print(f"    -c 16                    Set comparison workers")
     print(f"    --clip-ratio 0.50        Set clip match threshold")
@@ -589,6 +597,13 @@ class UnifiedCache:
         
         # Cache parameters for auto-invalidation on algorithm changes
         conn.execute("CREATE TABLE IF NOT EXISTS cache_params (key TEXT PRIMARY KEY, value TEXT)")
+        
+        # Dismissed pairs: content_key pairs the user explicitly skipped in the HTML report
+        # Persists across runs so previously-reviewed groups stay hidden
+        conn.execute("""CREATE TABLE IF NOT EXISTS dismissed_pairs (
+            key1 TEXT NOT NULL,
+            key2 TEXT NOT NULL,
+            PRIMARY KEY (key1, key2))""")
         conn.commit()
 
     def validate_params(self, config: Config) -> bool:
@@ -807,6 +822,47 @@ class UnifiedCache:
         except sqlite3.Error:
             pass
 
+    # ==================== DISMISSED PAIRS ====================
+    
+    def _normalize_dismissed_pair(self, k1: str, k2: str) -> Tuple[str, str]:
+        return (k1, k2) if k1 <= k2 else (k2, k1)
+
+    def get_all_dismissed(self) -> set:
+        """Return set of (key1, key2) tuples for all dismissed pairs."""
+        result = set()
+        try:
+            for row in self._get_conn().execute("SELECT key1, key2 FROM dismissed_pairs"):
+                result.add((row[0], row[1]))
+        except sqlite3.Error:
+            pass
+        return result
+
+    def batch_add_dismissed(self, pairs: List[Tuple[str, str]]):
+        """Add dismissed content_key pairs (normalized)."""
+        if not pairs:
+            return
+        try:
+            conn = self._get_conn()
+            normalized = [self._normalize_dismissed_pair(k1, k2) for k1, k2 in pairs]
+            conn.executemany("INSERT OR IGNORE INTO dismissed_pairs (key1, key2) VALUES (?,?)", normalized)
+            conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def clear_dismissed(self):
+        try:
+            c = self._get_conn()
+            c.execute("DELETE FROM dismissed_pairs")
+            c.commit()
+        except sqlite3.Error:
+            pass
+
+    def get_dismissed_count(self) -> int:
+        try:
+            return self._get_conn().execute("SELECT COUNT(*) FROM dismissed_pairs").fetchone()[0]
+        except sqlite3.Error:
+            return 0
+
     # ==================== CACHE MANAGEMENT ====================
     
     def clear_fingerprints(self):
@@ -878,7 +934,7 @@ class UnifiedCache:
         
         Returns dict with counts of removed entries.
         """
-        removed = {'fingerprints': 0, 'comparisons': 0, 'failed': 0}
+        removed = {'fingerprints': 0, 'comparisons': 0, 'failed': 0, 'dismissed': 0}
         try:
             conn = self._get_conn()
             
@@ -926,6 +982,13 @@ class UnifiedCache:
             if removed['failed'] > 0:
                 conn.execute("DELETE FROM failed_files WHERE content_key IN (SELECT key FROM temp_orphan_keys)")
             
+            # Delete dismissed pairs where EITHER key is orphaned
+            removed['dismissed'] = conn.execute(
+                "SELECT COUNT(*) FROM dismissed_pairs WHERE key1 IN (SELECT key FROM temp_orphan_keys) OR key2 IN (SELECT key FROM temp_orphan_keys)"
+            ).fetchone()[0]
+            if removed['dismissed'] > 0:
+                conn.execute("DELETE FROM dismissed_pairs WHERE key1 IN (SELECT key FROM temp_orphan_keys) OR key2 IN (SELECT key FROM temp_orphan_keys)")
+            
             conn.execute("DROP TABLE IF EXISTS temp_orphan_keys")
             conn.commit()
             
@@ -934,7 +997,7 @@ class UnifiedCache:
                 print("   Reclaiming disk space (VACUUM)...")
                 conn.execute("VACUUM")
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                
+            
         except sqlite3.Error as e:
             print(f"Warning: Cleanup error: {e}")
         
@@ -1288,7 +1351,7 @@ def compare_batch(batch: List[Tuple[str, str]], config: Config):
 # HTML INTERACTIVE REPORT
 # ============================================================================
 
-def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints, display_root, total_delete, total_savings, partial=False):
+def _generate_html_report(results_dir, dup_groups, clip_deletions, clip_dismissed, clip_content_keys, fingerprints, display_root, total_delete, total_savings, partial=False):
     """Generate an interactive HTML report for reviewing duplicates."""
     html_path = os.path.join(results_dir, 'review_results.html')
 
@@ -1315,6 +1378,8 @@ def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints,
             'savings_fmt': format_size(g['potential_savings']),
             'size_warning': g.get('size_warning', False),
             'identical': g.get('identical', False),
+            'previously_skipped': g.get('previously_skipped', False),
+            'content_keys': g.get('content_keys', []),
         })
 
     clips_js = []
@@ -1331,6 +1396,7 @@ def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints,
                 'size_fmt': format_size(pfp.get('file_size', 0)),
                 'dur_fmt': format_duration(pfp.get('duration', 0)),
             })
+        ck_child, ck_parents = clip_content_keys[ci] if ci < len(clip_content_keys) else ('', [])
         clips_js.append({
             'id': ci,
             'child_path': os.path.abspath(child),
@@ -1342,6 +1408,9 @@ def _generate_html_report(results_dir, dup_groups, clip_deletions, fingerprints,
             'ratio': f"{ratio*100:.0f}%",
             'parents': parent_files,
             'delete': True,
+            'previously_skipped': clip_dismissed[ci] if ci < len(clip_dismissed) else False,
+            'ck_child': ck_child,
+            'ck_parents': ck_parents,
         })
 
     data_json = json.dumps({'groups': groups_js, 'clips': clips_js}, ensure_ascii=False).replace('</', '<\\/')
@@ -1360,16 +1429,26 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 .summary .stat {{ text-align: center; }}
 .summary .stat .num {{ font-size: 24px; font-weight: bold; color: #e94560; }}
 .summary .stat .label {{ font-size: 12px; color: #888; }}
-.card {{ background: #16213e; border-radius: 8px; padding: 20px; margin-bottom: 15px; border-left: 4px solid #0f3460; }}
+.card {{ background: #16213e; border-radius: 8px; margin-bottom: 10px; border-left: 4px solid #0f3460; overflow: hidden; }}
 .card.warning {{ border-left-color: #e9a045; }}
 .card.identical {{ border-left-color: #4ecca3; }}
-.card-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
-.card-title {{ font-weight: bold; font-size: 16px; }}
-.badge {{ padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }}
+.card.prev-skipped {{ opacity: 0.6; border-left-color: #555; }}
+.card-header {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; cursor: pointer; user-select: none; }}
+.card-header:hover {{ background: #1a2a4e; }}
+.card-title {{ font-weight: bold; font-size: 14px; }}
+.card-summary {{ font-size: 12px; color: #aaa; margin-left: 12px; flex: 1; text-align: right; }}
+.card-summary .keep-name {{ color: #4ecca3; font-weight: bold; }}
+.card-summary .skip-label {{ color: #888; }}
+.card-summary .action-label {{ color: #e94560; }}
+.card-body {{ padding: 0 20px 15px; }}
+.card-body.collapsed {{ display: none; }}
+.badge {{ padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; white-space: nowrap; }}
 .badge-warn {{ background: #e9a045; color: #000; }}
 .badge-savings {{ background: #0f3460; color: #e0e0e0; }}
 .badge-clip {{ background: #533483; color: #e0e0e0; }}
 .badge-identical {{ background: #4ecca3; color: #000; }}
+.badge-skipped {{ background: #555; color: #ccc; }}
+.badge-rec {{ background: transparent; border: 1px solid #4ecca3; color: #4ecca3; }}
 .file-row {{ background: #0f3460; border-radius: 6px; padding: 12px 15px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: background 0.15s; }}
 .file-row:hover {{ background: #1a4a8a; }}
 .file-row.selected-keep {{ border: 2px solid #4ecca3; background: #0f3460; }}
@@ -1386,10 +1465,9 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 .btn-rename {{ background: #533483; color: #fff; }}
 .btn-skip {{ background: #555; color: #fff; }}
 .btn.active {{ box-shadow: 0 0 0 2px #fff; }}
-.clip-row {{ background: #0f3460; border-radius: 6px; padding: 12px 15px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; }}
-.clip-toggle {{ display: flex; gap: 6px; }}
-.generate {{ position: sticky; bottom: 20px; background: #e94560; color: #fff; border: none; padding: 15px 30px; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; width: 100%; max-width: 500px; margin: 30px auto; display: block; box-shadow: 0 4px 15px rgba(233,69,96,0.4); }}
+.generate {{ position: sticky; bottom: 20px; background: #e94560; color: #fff; border: none; padding: 15px 30px; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; width: 100%; max-width: 500px; margin: 20px auto; display: block; box-shadow: 0 4px 15px rgba(233,69,96,0.4); }}
 .generate:hover {{ background: #d63851; }}
+.generate:disabled {{ background: #555; box-shadow: none; cursor: default; }}
 .section-title {{ font-size: 20px; font-weight: bold; margin: 25px 0 15px; color: #4ecca3; }}
 .rename-info {{ font-size: 11px; color: #b388ff; margin-top: 4px; font-style: italic; }}
 .counter {{ position: fixed; top: 10px; right: 20px; background: #16213e; padding: 10px 15px; border-radius: 8px; font-size: 13px; z-index: 100; border: 1px solid #333; }}
@@ -1402,11 +1480,16 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 .rename-input {{ background: #1a1a2e; color: #e0e0e0; border: 1px solid #533483; border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 300px; margin-left: 4px; }}
 .rename-input:focus {{ outline: none; border-color: #b388ff; }}
 .dir-select {{ background: #1a1a2e; color: #e0e0e0; border: 1px solid #533483; border-radius: 4px; padding: 2px 4px; font-size: 11px; max-width: 400px; margin-left: 4px; }}
+.toggle-bar {{ background: #16213e; padding: 10px 20px; border-radius: 8px; margin-bottom: 15px; display: flex; align-items: center; gap: 15px; border: 1px solid #333; font-size: 13px; }}
+.toggle-bar label {{ cursor: pointer; }}
+.toggle-bar input {{ cursor: pointer; }}
+.expand-all {{ background: #0f3460; color: #aaa; border: 1px solid #333; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }}
+.expand-all:hover {{ color: #fff; border-color: #555; }}
 </style>
 </head>
 <body>
 <h1>VidClipDuplis — Review Results</h1>
-<p class="subtitle">Click files to set actions. Then generate a custom PowerShell script.</p>
+<p class="subtitle">Review matches, then download a custom PowerShell script. All groups default to <b>Skip</b> — nothing happens unless you decide.</p>
 {'<div style="background:#e9a045;color:#000;padding:12px 20px;border-radius:8px;margin-bottom:20px;font-weight:bold;">⚠️ PARTIAL RESULTS — Scan was interrupted (Ctrl+C). Not all comparisons were completed. Run again to get full results. Matches shown are from cached + computed comparisons so far.</div>' if partial else ''}
 
 <div class="summary">
@@ -1417,213 +1500,153 @@ h1 {{ color: #e94560; margin-bottom: 5px; }}
 </div>
 
 <div class="counter">
- <span id="reviewed">0</span> / <span id="total-groups">0</span> groups reviewed
+ <span id="action-count">0</span> actions &middot; <span id="skip-count2">0</span> skipped
+</div>
+
+<div class="toggle-bar">
+ <label><input type="checkbox" id="show-prev-skipped" onchange="togglePrevSkipped()"> Show previously skipped (<span id="prev-skip-count">0</span>)</label>
+ <button class="expand-all" onclick="expandAll()">Expand All</button>
+ <button class="expand-all" onclick="collapseAll()">Collapse All</button>
 </div>
 
 <div id="groups-container"></div>
 <div id="clips-container"></div>
 
 <div style="max-width:500px;margin:25px auto 5px;padding:12px 16px;background:#16213e;border-radius:8px;border:1px solid #333;font-size:12px;color:#aaa;text-align:center;">
-Use the button below to download a script with <b>your exact choices</b>.<br>
-Use RUN_CUSTOM_ACTIONS.bat to run your custom script. Save the downloaded .ps1 into the results folder first.
+Download your custom script, then save the dismissed-groups file next to VidClipDupli.py so skipped groups stay hidden on the next run.
 </div>
 
-<button class="generate" onclick="generateScript()">Download Custom PowerShell Script</button>
+<button class="generate" onclick="generateScript()" id="btn-generate">Download Custom PowerShell Script</button>
+<button class="generate" onclick="saveDismissed()" style="background:#555;box-shadow:none;margin-top:5px;font-size:13px;">Save Dismissed Groups (vcd_dismissed.json)</button>
 
 <script>
 const DATA = {data_json};
-
 const state = {{}};
 const clipState = {{}};
+const expanded = {{}};
+const clipExpanded = {{}};
 
 function init() {{
   const gc = document.getElementById('groups-container');
   const cc = document.getElementById('clips-container');
-  document.getElementById('total-groups').textContent = DATA.groups.length;
+  const newGroups = DATA.groups.filter(g => !g.previously_skipped);
+  const prevGroups = DATA.groups.filter(g => g.previously_skipped);
+  const newClips = DATA.clips.filter(c => !c.previously_skipped);
+  const prevClips = DATA.clips.filter(c => c.previously_skipped);
+  document.getElementById('prev-skip-count').textContent = prevGroups.length + prevClips.length;
 
-  if (DATA.groups.length > 0) {{
-    gc.innerHTML = '<div class="section-title">Duplicate Groups (' + DATA.groups.length + ')</div>';
-  }}
+  let ghtml = '';
+  if (newGroups.length > 0) ghtml += '<div class="section-title">Duplicate Groups (' + newGroups.length + ')</div>';
 
   DATA.groups.forEach((g, gi) => {{
     const keepIdx = g.files.findIndex(f => f.is_keep);
     const ki = keepIdx >= 0 ? keepIdx : 0;
-    state[gi] = {{ keep: ki, rename_from: null, custom_name: null, target_dir: g.files[ki].dir, action: 'decided' }};
-
+    state[gi] = {{ keep: ki, rename_from: null, custom_name: null, target_dir: g.files[ki].dir, action: 'skipped' }};
+    expanded[gi] = false;
+    const isPrev = g.previously_skipped;
     let warn = g.size_warning ? ' warning' : (g.identical ? ' identical' : '');
+    if (isPrev) warn += ' prev-skipped';
     let badges = '';
-    if (g.identical) badges += ' <span class="badge badge-identical">IDENTICAL FILES</span>';
-    if (g.size_warning) badges += ' <span class="badge badge-warn">SIZE MISMATCH</span>';
-    let html = '<div class="card' + warn + '" id="group-' + gi + '">';
-    html += '<div class="card-header"><span class="card-title">Group ' + (gi+1) + ' (' + g.files.length + ' files)' + badges + '</span>';
-    html += '<span class="badge badge-savings">Save ' + g.savings_fmt + '</span></div>';
-
+    if (g.identical) badges += '<span class="badge badge-identical">IDENTICAL</span> ';
+    if (g.size_warning) badges += '<span class="badge badge-warn">SIZE MISMATCH</span> ';
+    badges += '<span class="badge badge-rec">\u2605 ' + escHtml(g.files[ki].filename) + '</span>';
+    ghtml += '<div class="card' + warn + '" id="group-' + gi + '"' + (isPrev ? ' data-prev="1" style="display:none"' : '') + '>';
+    ghtml += '<div class="card-header" onclick="toggleGroup(' + gi + ')"><span class="card-title">Group ' + (gi+1) + ' (' + g.files.length + ' files) ' + badges + '</span>';
+    ghtml += '<span class="card-summary" id="summary-' + gi + '"><span class="skip-label">Skipped</span></span></div>';
+    ghtml += '<div class="card-body collapsed" id="body-' + gi + '">';
     g.files.forEach((f, fi) => {{
       const pe = pathEsc(f.path);
-      html += '<div class="file-row" id="row-' + gi + '-' + fi + '">';
-      html += '<div class="file-info">';
-      html += '<div class="file-path"><a class="file-link" href="#" onclick="openFile(\\'' + pe + '\\'); return false;"><span class="file-name">' + escHtml(f.filename) + '</span></a></div>';
-      html += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="openFolder(\\'' + pe + '\\'); return false;">' + escHtml(f.dir) + '</a></div>';
-      html += '<div class="file-meta">' + f.size_fmt + ' &middot; ' + f.dur_fmt + '</div>';
-      html += '<div class="rename-info" id="rename-info-' + gi + '-' + fi + '" style="display:none"></div>';
-      html += '</div>';
-      html += '<div class="actions">';
-      html += '<button class="btn btn-open" onclick="openFile(\\'' + pe + '\\')">Open</button>';
-      html += '<button class="btn btn-keep" onclick="setKeep(' + gi + ',' + fi + ')">Keep</button>';
-      html += '<button class="btn btn-delete" onclick="setDelete(' + gi + ',' + fi + ')">Delete</button>';
-      html += '<button class="btn btn-rename" onclick="setRename(' + gi + ',' + fi + ')" title="Keep the largest file but use this filename">Use Name</button>';
-      html += '</div></div>';
+      ghtml += '<div class="file-row" id="row-' + gi + '-' + fi + '"><div class="file-info">';
+      ghtml += '<div class="file-path"><a class="file-link" href="#" onclick="event.stopPropagation();openFile(\\\'' + pe + '\\\');return false;"><span class="file-name">' + escHtml(f.filename) + '</span></a></div>';
+      ghtml += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="event.stopPropagation();openFolder(\\\'' + pe + '\\\');return false;">' + escHtml(f.dir) + '</a></div>';
+      ghtml += '<div class="file-meta">' + f.size_fmt + ' \u00b7 ' + f.dur_fmt + '</div>';
+      ghtml += '<div class="rename-info" id="rename-info-' + gi + '-' + fi + '" style="display:none"></div></div>';
+      ghtml += '<div class="actions"><button class="btn btn-open" onclick="event.stopPropagation();openFile(\\\'' + pe + '\\\')">Open</button>';
+      ghtml += '<button class="btn btn-keep" onclick="event.stopPropagation();setKeep(' + gi + ',' + fi + ')">Keep</button>';
+      ghtml += '<button class="btn btn-delete" onclick="event.stopPropagation();setDelete(' + gi + ',' + fi + ')">Delete</button>';
+      ghtml += '<button class="btn btn-rename" onclick="event.stopPropagation();setRename(' + gi + ',' + fi + ')">Use Name</button></div></div>';
     }});
-
-    html += '<div style="text-align:right;margin-top:8px"><button class="btn btn-skip" onclick="setSkip(' + gi + ')">Skip Group</button></div>';
-    html += '</div>';
-    gc.innerHTML += html;
+    ghtml += '<div style="text-align:right;margin-top:8px"><button class="btn btn-skip" onclick="event.stopPropagation();setSkip(' + gi + ')">Skip Group</button></div>';
+    ghtml += '</div></div>';
   }});
+  if (prevGroups.length > 0) ghtml += '<div class="section-title" id="prev-dup-title" style="display:none">Previously Skipped Duplicates (' + prevGroups.length + ')</div>';
+  gc.innerHTML = ghtml;
 
-  if (DATA.clips.length > 0) {{
-    cc.innerHTML = '<div class="section-title">Redundant Clips (' + DATA.clips.length + ')</div>';
-    DATA.clips.forEach((c, ci) => {{
-      const parent = c.parents[0] || {{}};
-      // State: keep='clip' or 'parent', rename_to=null/filename, action='decided'/'skipped'
-      clipState[ci] = {{ keep: 'parent', rename_to: null, custom_name: null, target_dir: (parent.dir || ''), action: 'decided' }};
-      
-      const parentPathEsc = pathEsc(parent.path || '');
-      const childPathEsc = pathEsc(c.child_path);
-      
-      let html = '<div class="card" id="clip-' + ci + '">';
-      html += '<div class="card-header"><span class="card-title">Clip ' + (ci+1) + ' <span class="badge badge-clip">' + c.ratio + ' match</span></span>';
-      html += '<span class="badge badge-savings">Clip is subset of parent</span></div>';
-      
-      // Parent file (longer, recommended keep)
-      html += '<div class="file-row selected-keep" id="clip-' + ci + '-parent">';
-      html += '<div class="file-info">';
-      html += '<div class="file-path"><a class="file-link" href="#" onclick="openFile(\\'' + parentPathEsc + '\\'); return false;"><span class="file-name">' + escHtml(parent.name || 'Unknown') + '</span></a> <span style="color:#4ecca3;font-size:11px">PARENT (longer)</span></div>';
-      html += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="openFolder(\\'' + parentPathEsc + '\\'); return false;">' + escHtml(parent.dir || '') + '</a></div>';
-      html += '<div class="file-meta">' + (parent.size_fmt || '?') + ' &middot; ' + (parent.dur_fmt || '?') + '</div>';
-      html += '<div class="rename-info" id="clip-rename-' + ci + '-parent" style="display:none"></div>';
-      html += '</div>';
-      html += '<div class="actions">';
-      html += '<button class="btn btn-open" onclick="openFile(\\'' + parentPathEsc + '\\')">Open</button>';
-      html += '<button class="btn btn-keep" onclick="setClipKeep(' + ci + ',\\'parent\\')">Keep</button>';
-      html += '<button class="btn btn-rename" onclick="setClipName(' + ci + ',\\'clip\\')" title="Keep parent but use clip filename">Use Name</button>';
-      html += '</div></div>';
-      
-      // Clip file (shorter, recommended delete)
-      html += '<div class="file-row selected-delete" id="clip-' + ci + '-clip">';
-      html += '<div class="file-info">';
-      html += '<div class="file-path"><a class="file-link" href="#" onclick="openFile(\\'' + childPathEsc + '\\'); return false;"><span class="file-name">' + escHtml(c.child_name) + '</span></a> <span style="color:#e94560;font-size:11px">CLIP (shorter)</span></div>';
-      html += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="openFolder(\\'' + childPathEsc + '\\'); return false;">' + escHtml(c.child_dir) + '</a></div>';
-      html += '<div class="file-meta">' + c.child_size_fmt + ' &middot; ' + c.child_dur + '</div>';
-      html += '<div class="rename-info" id="clip-rename-' + ci + '-clip" style="display:none"></div>';
-      html += '</div>';
-      html += '<div class="actions">';
-      html += '<button class="btn btn-open" onclick="openFile(\\'' + childPathEsc + '\\')">Open</button>';
-      html += '<button class="btn btn-keep" onclick="setClipKeep(' + ci + ',\\'clip\\')">Keep</button>';
-      html += '<button class="btn btn-rename" onclick="setClipName(' + ci + ',\\'parent\\')" title="Keep clip but use parent filename">Use Name</button>';
-      html += '</div></div>';
-      
-      html += '<div style="text-align:right;margin-top:8px"><button class="btn btn-skip" onclick="setClipSkip(' + ci + ')">Skip</button></div>';
-      html += '</div>';
-      cc.innerHTML += html;
-    }});
-  }}
-
+  let chtml = '';
+  if (newClips.length > 0) chtml += '<div class="section-title">Redundant Clips (' + newClips.length + ')</div>';
+  DATA.clips.forEach((c, ci) => {{
+    const parent = c.parents[0] || {{}};
+    clipState[ci] = {{ keep: 'parent', rename_to: null, custom_name: null, target_dir: (parent.dir || ''), action: 'skipped' }};
+    clipExpanded[ci] = false;
+    const isPrev = c.previously_skipped;
+    const parentPathEsc = pathEsc(parent.path || '');
+    const childPathEsc = pathEsc(c.child_path);
+    chtml += '<div class="card' + (isPrev ? ' prev-skipped' : '') + '" id="clip-' + ci + '"' + (isPrev ? ' data-prev="1" style="display:none"' : '') + '>';
+    chtml += '<div class="card-header" onclick="toggleClip(' + ci + ')"><span class="card-title">Clip ' + (ci+1) + ' <span class="badge badge-clip">' + c.ratio + '</span> ' + escHtml(c.child_name) + '</span>';
+    chtml += '<span class="card-summary" id="clip-summary-' + ci + '"><span class="skip-label">Skipped</span></span></div>';
+    chtml += '<div class="card-body collapsed" id="clip-body-' + ci + '">';
+    chtml += '<div class="file-row" id="clip-' + ci + '-parent"><div class="file-info">';
+    chtml += '<div class="file-path"><a class="file-link" href="#" onclick="event.stopPropagation();openFile(\\\'' + parentPathEsc + '\\\');return false;"><span class="file-name">' + escHtml(parent.name || 'Unknown') + '</span></a> <span style="color:#4ecca3;font-size:11px">PARENT</span></div>';
+    chtml += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="event.stopPropagation();openFolder(\\\'' + parentPathEsc + '\\\');return false;">' + escHtml(parent.dir || '') + '</a></div>';
+    chtml += '<div class="file-meta">' + (parent.size_fmt||'?') + ' \u00b7 ' + (parent.dur_fmt||'?') + '</div>';
+    chtml += '<div class="rename-info" id="clip-rename-' + ci + '-parent" style="display:none"></div></div>';
+    chtml += '<div class="actions"><button class="btn btn-open" onclick="event.stopPropagation();openFile(\\\'' + parentPathEsc + '\\\')">Open</button>';
+    chtml += '<button class="btn btn-keep" onclick="event.stopPropagation();setClipKeep(' + ci + ',\\\'parent\\\')">Keep</button>';
+    chtml += '<button class="btn btn-rename" onclick="event.stopPropagation();setClipName(' + ci + ',\\\'clip\\\')">Use Name</button></div></div>';
+    chtml += '<div class="file-row" id="clip-' + ci + '-clip"><div class="file-info">';
+    chtml += '<div class="file-path"><a class="file-link" href="#" onclick="event.stopPropagation();openFile(\\\'' + childPathEsc + '\\\');return false;"><span class="file-name">' + escHtml(c.child_name) + '</span></a> <span style="color:#e94560;font-size:11px">CLIP</span></div>';
+    chtml += '<div class="file-path" style="font-size:11px;color:#666"><a class="folder-link" href="#" onclick="event.stopPropagation();openFolder(\\\'' + childPathEsc + '\\\');return false;">' + escHtml(c.child_dir) + '</a></div>';
+    chtml += '<div class="file-meta">' + c.child_size_fmt + ' \u00b7 ' + c.child_dur + '</div>';
+    chtml += '<div class="rename-info" id="clip-rename-' + ci + '-clip" style="display:none"></div></div>';
+    chtml += '<div class="actions"><button class="btn btn-open" onclick="event.stopPropagation();openFile(\\\'' + childPathEsc + '\\\')">Open</button>';
+    chtml += '<button class="btn btn-keep" onclick="event.stopPropagation();setClipKeep(' + ci + ',\\\'clip\\\')">Keep</button>';
+    chtml += '<button class="btn btn-rename" onclick="event.stopPropagation();setClipName(' + ci + ',\\\'parent\\\')">Use Name</button></div></div>';
+    chtml += '<div style="text-align:right;margin-top:8px"><button class="btn btn-skip" onclick="event.stopPropagation();setClipSkip(' + ci + ')">Skip</button></div>';
+    chtml += '</div></div>';
+  }});
+  if (prevClips.length > 0) chtml += '<div class="section-title" id="prev-clip-title" style="display:none">Previously Skipped Clips (' + prevClips.length + ')</div>';
+  cc.innerHTML = chtml;
   updateAllRows();
   updateCounters();
 }}
 
-function escHtml(s) {{
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+function escHtml(s) {{ const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }}
+function pathEsc(p) {{ return p.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'").replace(/`/g, '\\\\`').replace(/"/g, '&quot;'); }}
+function toFileUrl(path) {{ let p = path.replace(/\\\\/g, '/'); p = p.replace(/%/g, '%25').replace(/#/g, '%23').replace(/\\?/g, '%3F'); if (p.startsWith('//')) return 'file:' + p; return 'file:///' + p; }}
+function openFile(path) {{ window.open(toFileUrl(path), '_blank'); }}
+function openFolder(path) {{ const f = path.substring(0, path.lastIndexOf('\\\\')); window.open(toFileUrl(f), '_blank'); }}
+function toggleGroup(gi) {{ expanded[gi] = !expanded[gi]; document.getElementById('body-' + gi).className = expanded[gi] ? 'card-body' : 'card-body collapsed'; }}
+function toggleClip(ci) {{ clipExpanded[ci] = !clipExpanded[ci]; document.getElementById('clip-body-' + ci).className = clipExpanded[ci] ? 'card-body' : 'card-body collapsed'; }}
+function expandAll() {{ DATA.groups.forEach((_, gi) => {{ expanded[gi] = true; document.getElementById('body-' + gi).className = 'card-body'; }}); DATA.clips.forEach((_, ci) => {{ clipExpanded[ci] = true; document.getElementById('clip-body-' + ci).className = 'card-body'; }}); }}
+function collapseAll() {{ DATA.groups.forEach((_, gi) => {{ expanded[gi] = false; document.getElementById('body-' + gi).className = 'card-body collapsed'; }}); DATA.clips.forEach((_, ci) => {{ clipExpanded[ci] = false; document.getElementById('clip-body-' + ci).className = 'card-body collapsed'; }}); }}
+function togglePrevSkipped() {{ const show = document.getElementById('show-prev-skipped').checked; document.querySelectorAll('[data-prev="1"]').forEach(el => el.style.display = show ? '' : 'none'); const pt1 = document.getElementById('prev-dup-title'); const pt2 = document.getElementById('prev-clip-title'); if (pt1) pt1.style.display = show ? '' : 'none'; if (pt2) pt2.style.display = show ? '' : 'none'; }}
+
+function setKeep(gi, fi) {{ state[gi].keep = fi; state[gi].rename_from = null; state[gi].target_dir = DATA.groups[gi].files[fi].dir; state[gi].action = 'decided'; updateGroupRows(gi); updateGroupSummary(gi); updateCounters(); }}
+function setDelete(gi, fi) {{ const g = DATA.groups[gi]; const oi = g.files.findIndex((_, i) => i !== fi); if (oi >= 0) {{ state[gi].keep = oi; state[gi].target_dir = g.files[oi].dir; }} state[gi].rename_from = null; state[gi].action = 'decided'; updateGroupRows(gi); updateGroupSummary(gi); updateCounters(); }}
+function setRename(gi, fi) {{ if (state[gi].keep === fi) return; state[gi].rename_from = fi; state[gi].custom_name = DATA.groups[gi].files[fi].filename; state[gi].action = 'decided'; updateGroupRows(gi); updateGroupSummary(gi); updateCounters(); }}
+function setSkip(gi) {{ state[gi].action = 'skipped'; updateGroupRows(gi); updateGroupSummary(gi); updateCounters(); }}
+function setClipKeep(ci, which) {{ const c = DATA.clips[ci]; clipState[ci].keep = which; clipState[ci].rename_to = null; clipState[ci].target_dir = which === 'parent' ? (c.parents[0] ? c.parents[0].dir : '') : c.child_dir; clipState[ci].action = 'decided'; updateClipRows(ci); updateClipSummary(ci); updateCounters(); }}
+function setClipName(ci, useNameFrom) {{ clipState[ci].rename_to = useNameFrom; const c = DATA.clips[ci]; clipState[ci].custom_name = useNameFrom === 'clip' ? c.child_name : (c.parents[0] ? c.parents[0].name : ''); clipState[ci].action = 'decided'; updateClipRows(ci); updateClipSummary(ci); updateCounters(); }}
+function setClipSkip(ci) {{ clipState[ci].action = 'skipped'; updateClipRows(ci); updateClipSummary(ci); updateCounters(); }}
+
+function updateGroupSummary(gi) {{
+  const el = document.getElementById('summary-' + gi);
+  const g = DATA.groups[gi]; const s = state[gi];
+  if (s.action === 'skipped') {{ el.innerHTML = '<span class="skip-label">Skipped</span>'; return; }}
+  const kf = g.files[s.keep];
+  let name = kf.filename;
+  if (s.rename_from !== null) name = s.custom_name || g.files[s.rename_from].filename;
+  const dir = s.target_dir || kf.dir;
+  el.innerHTML = '<span class="action-label">Delete ' + (g.files.length - 1) + '</span> \u00b7 Keep: <span class="keep-name">' + escHtml(name) + '</span> \u2192 ' + escHtml(dir);
 }}
 
-function pathEsc(p) {{
-  // Escape path for use in onclick handlers (single-quoted JS string)
-  return p.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'").replace(/`/g, '\\\\`').replace(/"/g, '&quot;');
-}}
-
-function toFileUrl(path) {{
-  // Convert Windows path to file:// URL
-  let p = path.replace(/\\\\/g, '/');
-  // Encode chars that have special meaning in URLs (% first to avoid double-encoding)
-  p = p.replace(/%/g, '%25').replace(/#/g, '%23').replace(/\\?/g, '%3F');
-  if (p.startsWith('//')) {{
-    // UNC path: \\\\server\\share → file://server/share (RFC 8089)
-    return 'file:' + p;
-  }}
-  // Local drive: C:\\folder\\file.mp4 → file:///C:/folder/file.mp4
-  return 'file:///' + p;
-}}
-
-function openFile(path) {{
-  window.open(toFileUrl(path), '_blank');
-}}
-
-function openFolder(path) {{
-  // Open the containing folder
-  const folder = path.substring(0, path.lastIndexOf('\\\\'));
-  window.open(toFileUrl(folder), '_blank');
-}}
-
-function setKeep(gi, fi) {{
-  state[gi].keep = fi;
-  state[gi].rename_from = null;
-  state[gi].target_dir = DATA.groups[gi].files[fi].dir;
-  state[gi].action = 'decided';
-  updateGroupRows(gi);
-  updateCounters();
-}}
-
-function setDelete(gi, fi) {{
-  const g = DATA.groups[gi];
-  const otherIdx = g.files.findIndex((_, i) => i !== fi);
-  if (otherIdx >= 0) {{ state[gi].keep = otherIdx; state[gi].target_dir = g.files[otherIdx].dir; }}
-  state[gi].rename_from = null;
-  state[gi].action = 'decided';
-  updateGroupRows(gi);
-  updateCounters();
-}}
-
-function setRename(gi, fi) {{
-  if (state[gi].keep === fi) {{ return; }}
-  state[gi].rename_from = fi;
-  state[gi].custom_name = DATA.groups[gi].files[fi].filename;
-  state[gi].action = 'decided';
-  updateGroupRows(gi);
-  updateCounters();
-}}
-
-function setSkip(gi) {{
-  state[gi].action = 'skipped';
-  updateGroupRows(gi);
-  updateCounters();
-}}
-
-function setClipKeep(ci, which) {{
-  const c = DATA.clips[ci];
-  clipState[ci].keep = which;
-  clipState[ci].rename_to = null;
-  clipState[ci].target_dir = which === 'parent' ? (c.parents[0] ? c.parents[0].dir : '') : c.child_dir;
-  clipState[ci].action = 'decided';
-  updateClipRows(ci);
-  updateCounters();
-}}
-
-function setClipName(ci, useNameFrom) {{
-  // useNameFrom is which file's name to use (opposite of which we're keeping)
-  clipState[ci].rename_to = useNameFrom;
-  const c = DATA.clips[ci];
-  clipState[ci].custom_name = useNameFrom === 'clip' ? c.child_name : (c.parents[0] ? c.parents[0].name : '');
-  clipState[ci].action = 'decided';
-  updateClipRows(ci);
-  updateCounters();
-}}
-
-function setClipSkip(ci) {{
-  clipState[ci].action = 'skipped';
-  updateClipRows(ci);
-  updateCounters();
+function updateClipSummary(ci) {{
+  const el = document.getElementById('clip-summary-' + ci);
+  const cs = clipState[ci]; const c = DATA.clips[ci];
+  if (cs.action === 'skipped') {{ el.innerHTML = '<span class="skip-label">Skipped</span>'; return; }}
+  const parent = c.parents[0] || {{}};
+  if (cs.keep === 'parent') {{ el.innerHTML = '<span class="action-label">Delete clip</span> \u00b7 Keep: <span class="keep-name">' + escHtml(parent.name || '?') + '</span>'; }}
+  else {{ el.innerHTML = '<span class="action-label">Delete parent</span> \u00b7 Keep: <span class="keep-name">' + escHtml(c.child_name) + '</span>'; }}
 }}
 
 function updateClipRows(ci) {{
@@ -1632,226 +1655,125 @@ function updateClipRows(ci) {{
   const clipRow = document.getElementById('clip-' + ci + '-clip');
   const parentRename = document.getElementById('clip-rename-' + ci + '-parent');
   const clipRename = document.getElementById('clip-rename-' + ci + '-clip');
-  
-  parentRow.className = 'file-row';
-  clipRow.className = 'file-row';
-  parentRename.style.display = 'none';
-  clipRename.style.display = 'none';
-  parentRename.innerHTML = '';
-  clipRename.innerHTML = '';
-  
+  parentRow.className = 'file-row'; clipRow.className = 'file-row';
+  parentRename.style.display = 'none'; clipRename.style.display = 'none';
+  parentRename.innerHTML = ''; clipRename.innerHTML = '';
   const pdir = c.parents[0] ? c.parents[0].dir : '';
   const hasDiffDirs = pdir && c.child_dir && pdir !== c.child_dir;
   const cdirs = hasDiffDirs ? [pdir, c.child_dir] : [];
-  
-  if (clipState[ci].action === 'skipped') {{
-    parentRow.className = 'file-row selected-skip';
-    clipRow.className = 'file-row selected-skip';
-  }} else if (clipState[ci].keep === 'parent') {{
-    parentRow.className = 'file-row selected-keep';
-    clipRow.className = 'file-row selected-delete';
+  if (clipState[ci].action === 'skipped') {{ parentRow.className = 'file-row selected-skip'; clipRow.className = 'file-row selected-skip'; }}
+  else if (clipState[ci].keep === 'parent') {{
+    parentRow.className = 'file-row selected-keep'; clipRow.className = 'file-row selected-delete';
     let rhtml = '';
-    if (clipState[ci].rename_to === 'clip') {{
-      const curName = clipState[ci].custom_name || c.child_name;
-      rhtml += '<span style="color:#b388ff">Rename to: </span>';
-      rhtml += '<input type="text" class="rename-input" value="' + escHtml(curName) + '" '
-        + 'onchange="clipState[' + ci + '].custom_name = this.value" '
-        + 'onclick="event.stopPropagation()" />';
-    }}
-    if (hasDiffDirs) {{
-      rhtml += (rhtml ? '<br>' : '') + '<span style="color:#b388ff;font-size:11px">Save in: </span>';
-      rhtml += '<select class="dir-select" onchange="clipState[' + ci + '].target_dir = this.value" onclick="event.stopPropagation()">';
-      cdirs.forEach(d => {{
-        const sel = d === (clipState[ci].target_dir || pdir) ? ' selected' : '';
-        rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
-      }});
-      rhtml += '</select>';
-    }}
+    if (clipState[ci].rename_to === 'clip') {{ const cn = clipState[ci].custom_name || c.child_name; rhtml += '<span style="color:#b388ff">Rename to: </span><input type="text" class="rename-input" value="' + escHtml(cn) + '" onchange="clipState[' + ci + '].custom_name=this.value" onclick="event.stopPropagation()" />'; }}
+    if (hasDiffDirs) {{ rhtml += (rhtml?'<br>':'') + '<span style="color:#b388ff;font-size:11px">Save in: </span><select class="dir-select" onchange="clipState[' + ci + '].target_dir=this.value" onclick="event.stopPropagation()">'; cdirs.forEach(d => {{ rhtml += '<option value="' + escHtml(d) + '"' + (d===(clipState[ci].target_dir||pdir)?' selected':'') + '>' + escHtml(d) + '</option>'; }}); rhtml += '</select>'; }}
     if (rhtml) {{ parentRename.innerHTML = rhtml; parentRename.style.display = 'block'; }}
   }} else {{
-    clipRow.className = 'file-row selected-keep';
-    parentRow.className = 'file-row selected-delete';
+    clipRow.className = 'file-row selected-keep'; parentRow.className = 'file-row selected-delete';
     let rhtml = '';
-    if (clipState[ci].rename_to === 'parent') {{
-      const pname = clipState[ci].custom_name || (c.parents[0] ? c.parents[0].name : '');
-      rhtml += '<span style="color:#b388ff">Rename to: </span>';
-      rhtml += '<input type="text" class="rename-input" value="' + escHtml(pname) + '" '
-        + 'onchange="clipState[' + ci + '].custom_name = this.value" '
-        + 'onclick="event.stopPropagation()" />';
-    }}
-    if (hasDiffDirs) {{
-      rhtml += (rhtml ? '<br>' : '') + '<span style="color:#b388ff;font-size:11px">Save in: </span>';
-      rhtml += '<select class="dir-select" onchange="clipState[' + ci + '].target_dir = this.value" onclick="event.stopPropagation()">';
-      cdirs.forEach(d => {{
-        const sel = d === (clipState[ci].target_dir || c.child_dir) ? ' selected' : '';
-        rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
-      }});
-      rhtml += '</select>';
-    }}
+    if (clipState[ci].rename_to === 'parent') {{ const pn = clipState[ci].custom_name || (c.parents[0] ? c.parents[0].name : ''); rhtml += '<span style="color:#b388ff">Rename to: </span><input type="text" class="rename-input" value="' + escHtml(pn) + '" onchange="clipState[' + ci + '].custom_name=this.value" onclick="event.stopPropagation()" />'; }}
+    if (hasDiffDirs) {{ rhtml += (rhtml?'<br>':'') + '<span style="color:#b388ff;font-size:11px">Save in: </span><select class="dir-select" onchange="clipState[' + ci + '].target_dir=this.value" onclick="event.stopPropagation()">'; cdirs.forEach(d => {{ rhtml += '<option value="' + escHtml(d) + '"' + (d===(clipState[ci].target_dir||c.child_dir)?' selected':'') + '>' + escHtml(d) + '</option>'; }}); rhtml += '</select>'; }}
     if (rhtml) {{ clipRename.innerHTML = rhtml; clipRename.style.display = 'block'; }}
   }}
 }}
 
 function updateGroupRows(gi) {{
-  const g = DATA.groups[gi];
-  const dirs = [...new Set(g.files.map(x => x.dir))];
+  const g = DATA.groups[gi]; const dirs = [...new Set(g.files.map(x => x.dir))];
   g.files.forEach((f, fi) => {{
     const row = document.getElementById('row-' + gi + '-' + fi);
-    const renameInfo = document.getElementById('rename-info-' + gi + '-' + fi);
-    row.className = 'file-row';
-    renameInfo.style.display = 'none';
-    renameInfo.innerHTML = '';
-
-    if (state[gi].action === 'skipped') {{
-      row.className = 'file-row selected-skip';
-    }} else if (fi === state[gi].keep) {{
+    const ri = document.getElementById('rename-info-' + gi + '-' + fi);
+    row.className = 'file-row'; ri.style.display = 'none'; ri.innerHTML = '';
+    if (state[gi].action === 'skipped') {{ row.className = 'file-row selected-skip'; }}
+    else if (fi === state[gi].keep) {{
       row.className = 'file-row selected-keep';
       let rhtml = '';
-      if (state[gi].rename_from !== null) {{
-        const curName = state[gi].custom_name || g.files[state[gi].rename_from].filename;
-        rhtml += '<span style="color:#b388ff">Rename to: </span>';
-        rhtml += '<input type="text" class="rename-input" value="' + escHtml(curName) + '" '
-          + 'onchange="state[' + gi + '].custom_name = this.value" '
-          + 'onclick="event.stopPropagation()" />';
-      }}
-      if (dirs.length > 1) {{
-        rhtml += (rhtml ? '<br>' : '') + '<span style="color:#b388ff;font-size:11px">Save in: </span>';
-        rhtml += '<select class="dir-select" onchange="state[' + gi + '].target_dir = this.value" onclick="event.stopPropagation()">';
-        dirs.forEach(d => {{
-          const sel = d === (state[gi].target_dir || f.dir) ? ' selected' : '';
-          rhtml += '<option value="' + escHtml(d) + '"' + sel + '>' + escHtml(d) + '</option>';
-        }});
-        rhtml += '</select>';
-      }}
-      if (rhtml) {{
-        renameInfo.innerHTML = rhtml;
-        renameInfo.style.display = 'block';
-      }}
-    }} else {{
-      row.className = 'file-row selected-delete';
-    }}
+      if (state[gi].rename_from !== null) {{ const cn = state[gi].custom_name || g.files[state[gi].rename_from].filename; rhtml += '<span style="color:#b388ff">Rename to: </span><input type="text" class="rename-input" value="' + escHtml(cn) + '" onchange="state[' + gi + '].custom_name=this.value" onclick="event.stopPropagation()" />'; }}
+      if (dirs.length > 1) {{ rhtml += (rhtml?'<br>':'') + '<span style="color:#b388ff;font-size:11px">Save in: </span><select class="dir-select" onchange="state[' + gi + '].target_dir=this.value" onclick="event.stopPropagation()">'; dirs.forEach(d => {{ rhtml += '<option value="' + escHtml(d) + '"' + (d===(state[gi].target_dir||f.dir)?' selected':'') + '>' + escHtml(d) + '</option>'; }}); rhtml += '</select>'; }}
+      if (rhtml) {{ ri.innerHTML = rhtml; ri.style.display = 'block'; }}
+    }} else {{ row.className = 'file-row selected-delete'; }}
   }});
 }}
 
-function updateAllRows() {{
-  DATA.groups.forEach((_, gi) => updateGroupRows(gi));
-  DATA.clips.forEach((_, ci) => updateClipRows(ci));
-}}
+function updateAllRows() {{ DATA.groups.forEach((_, gi) => {{ updateGroupRows(gi); updateGroupSummary(gi); }}); DATA.clips.forEach((_, ci) => {{ updateClipRows(ci); updateClipSummary(ci); }}); }}
 
 function updateCounters() {{
-  let dels = 0, changes = 0, skips = 0;
-  DATA.groups.forEach((g, gi) => {{
-    if (state[gi].action === 'skipped') {{ skips++; return; }}
-    dels += g.files.length - 1;
-    const kf = g.files[state[gi].keep];
-    if (state[gi].rename_from !== null || (state[gi].target_dir && state[gi].target_dir !== kf.dir)) changes++;
-  }});
-  DATA.clips.forEach((c, ci) => {{
-    const cs = clipState[ci];
-    if (cs.action === 'skipped') {{ skips++; return; }}
-    dels++;
-    const kdir = cs.keep === 'parent' ? (c.parents[0] ? c.parents[0].dir : '') : c.child_dir;
-    if (cs.rename_to !== null || (cs.target_dir && cs.target_dir !== kdir)) changes++;
-  }});
+  let dels = 0, changes = 0, skips = 0, actions = 0;
+  DATA.groups.forEach((g, gi) => {{ if (state[gi].action === 'skipped') {{ skips++; return; }} actions++; dels += g.files.length - 1; const kf = g.files[state[gi].keep]; if (state[gi].rename_from !== null || (state[gi].target_dir && state[gi].target_dir !== kf.dir)) changes++; }});
+  DATA.clips.forEach((c, ci) => {{ const cs = clipState[ci]; if (cs.action === 'skipped') {{ skips++; return; }} actions++; dels++; const kdir = cs.keep === 'parent' ? (c.parents[0] ? c.parents[0].dir : '') : c.child_dir; if (cs.rename_to !== null || (cs.target_dir && cs.target_dir !== kdir)) changes++; }});
   document.getElementById('del-count').textContent = dels;
   document.getElementById('rename-count').textContent = changes;
   document.getElementById('skip-count').textContent = skips;
-  document.getElementById('reviewed').textContent = Object.values(state).filter(s => s.action !== undefined).length;
+  document.getElementById('action-count').textContent = actions;
+  document.getElementById('skip-count2').textContent = skips;
+  const btn = document.getElementById('btn-generate');
+  btn.textContent = actions > 0 ? 'Download Custom PowerShell Script (' + actions + ' actions)' : 'Download Custom PowerShell Script (no actions)';
 }}
 
 function generateScript() {{
   let lines = [];
-  lines.push('# VidClipDuplis — Custom deletion/rename script');
+  lines.push('# VidClipDuplis \u2014 Custom deletion/rename script');
   lines.push('# Generated from interactive review');
   lines.push('# Run: powershell -ExecutionPolicy Bypass -File custom_actions.ps1');
   lines.push('');
   lines.push('Write-Host "This script will delete and rename files as you chose." -ForegroundColor Yellow');
   lines.push('$null = Read-Host "Press Enter to continue or Ctrl+C to cancel"');
   lines.push('');
-
   DATA.groups.forEach((g, gi) => {{
     if (state[gi].action === 'skipped') return;
-    const keepIdx = state[gi].keep;
-    const keepFile = g.files[keepIdx];
-
+    const keepIdx = state[gi].keep; const keepFile = g.files[keepIdx];
     lines.push('# Group ' + (gi+1));
-
-    g.files.forEach((f, fi) => {{
-      if (fi !== keepIdx) {{
-        const p = f.path.replace(/'/g, "''");
-        lines.push("Remove-Item -LiteralPath '" + p + "' -Force");
-      }}
-    }});
-
+    g.files.forEach((f, fi) => {{ if (fi !== keepIdx) lines.push("Remove-Item -LiteralPath '" + f.path.replace(/'/g, "''") + "' -Force"); }});
     if (state[gi].rename_from !== null) {{
       const newName = (state[gi].custom_name || g.files[state[gi].rename_from].filename);
       const targetDir = state[gi].target_dir || keepFile.dir;
-      if (targetDir !== keepFile.dir) {{
-        const dest = (targetDir + '\\\\' + newName).replace(/'/g, "''");
-        lines.push("Move-Item -LiteralPath '" + keepFile.path.replace(/'/g, "''") + "' -Destination '" + dest + "' -Force");
-      }} else if (newName !== keepFile.filename) {{
-        lines.push("Rename-Item -LiteralPath '" + keepFile.path.replace(/'/g, "''") + "' -NewName '" + newName.replace(/'/g, "''") + "'");
-      }}
+      if (targetDir !== keepFile.dir) {{ lines.push("Move-Item -LiteralPath '" + keepFile.path.replace(/'/g,"''") + "' -Destination '" + (targetDir+'\\\\'+newName).replace(/'/g,"''") + "' -Force"); }}
+      else if (newName !== keepFile.filename) {{ lines.push("Rename-Item -LiteralPath '" + keepFile.path.replace(/'/g,"''") + "' -NewName '" + newName.replace(/'/g,"''") + "'"); }}
     }} else {{
       const targetDir = state[gi].target_dir || keepFile.dir;
-      if (targetDir !== keepFile.dir) {{
-        const dest = (targetDir + '\\\\' + keepFile.filename).replace(/'/g, "''");
-        lines.push("Move-Item -LiteralPath '" + keepFile.path.replace(/'/g, "''") + "' -Destination '" + dest + "' -Force");
-      }}
+      if (targetDir !== keepFile.dir) {{ lines.push("Move-Item -LiteralPath '" + keepFile.path.replace(/'/g,"''") + "' -Destination '" + (targetDir+'\\\\'+keepFile.filename).replace(/'/g,"''") + "' -Force"); }}
     }}
     lines.push('');
   }});
-
   let hasClips = false;
   DATA.clips.forEach((c, ci) => {{
-    const cs = clipState[ci];
-    if (cs.action === 'skipped') return;
-    
+    const cs = clipState[ci]; if (cs.action === 'skipped') return;
     if (!hasClips) {{ lines.push('# Redundant clips'); hasClips = true; }}
-    
     const parent = c.parents[0] || {{}};
     let keptPath, keptDir, keptName, deletePath;
-    
-    if (cs.keep === 'parent') {{
-      deletePath = c.child_path;
-      keptPath = parent.path || '';
-      keptDir = parent.dir || '';
-      keptName = parent.name || '';
-    }} else {{
-      deletePath = parent.path || '';
-      keptPath = c.child_path;
-      keptDir = c.child_dir;
-      keptName = c.child_name;
-    }}
-    
-    if (deletePath) {{
-      lines.push("Remove-Item -LiteralPath '" + deletePath.replace(/'/g, "''") + "' -Force");
-    }}
-    
+    if (cs.keep === 'parent') {{ deletePath=c.child_path; keptPath=parent.path||''; keptDir=parent.dir||''; keptName=parent.name||''; }}
+    else {{ deletePath=parent.path||''; keptPath=c.child_path; keptDir=c.child_dir; keptName=c.child_name; }}
+    if (deletePath) lines.push("Remove-Item -LiteralPath '" + deletePath.replace(/'/g,"''") + "' -Force");
     const hasRename = cs.rename_to !== null;
-    const finalName = hasRename ? (cs.custom_name || (cs.keep === 'parent' ? c.child_name : (parent.name || ''))) : keptName;
+    const finalName = hasRename ? (cs.custom_name || (cs.keep==='parent' ? c.child_name : (parent.name||''))) : keptName;
     const targetDir = cs.target_dir || keptDir;
-    const needsMove = targetDir !== keptDir;
-    
-    if (needsMove && keptPath) {{
-      const dest = (targetDir + '\\\\' + finalName).replace(/'/g, "''");
-      lines.push("Move-Item -LiteralPath '" + keptPath.replace(/'/g, "''") + "' -Destination '" + dest + "' -Force");
-    }} else if (hasRename && finalName !== keptName && keptPath) {{
-      lines.push("Rename-Item -LiteralPath '" + keptPath.replace(/'/g, "''") + "' -NewName '" + finalName.replace(/'/g, "''") + "'");
-    }}
+    if (targetDir !== keptDir && keptPath) {{ lines.push("Move-Item -LiteralPath '" + keptPath.replace(/'/g,"''") + "' -Destination '" + (targetDir+'\\\\'+finalName).replace(/'/g,"''") + "' -Force"); }}
+    else if (hasRename && finalName !== keptName && keptPath) {{ lines.push("Rename-Item -LiteralPath '" + keptPath.replace(/'/g,"''") + "' -NewName '" + finalName.replace(/'/g,"''") + "'"); }}
     lines.push('');
   }});
-
-  lines.push('');
-  lines.push('Write-Host "Done!" -ForegroundColor Green');
-
-  // Add UTF-8 BOM so PowerShell correctly reads Unicode paths
+  lines.push(''); lines.push('Write-Host "Done!" -ForegroundColor Green');
   const blob = new Blob(['\\ufeff' + lines.join('\\r\\n')], {{ type: 'text/plain' }});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'custom_actions.ps1';
-  a.click();
-  URL.revokeObjectURL(a.href);
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'custom_actions.ps1'; a.click(); URL.revokeObjectURL(a.href);
+}}
+
+function saveDismissed() {{
+  const pairs = [];
+  DATA.groups.forEach((g, gi) => {{
+    if (state[gi].action === 'skipped' && g.content_keys) {{
+      const keys = g.content_keys;
+      if (keys.length >= 2) {{ for (let i=0;i<keys.length;i++) for (let j=i+1;j<keys.length;j++) {{ const a=keys[i]<=keys[j]?keys[i]:keys[j], b=keys[i]<=keys[j]?keys[j]:keys[i]; pairs.push([a,b]); }} }}
+      else if (keys.length === 1) pairs.push([keys[0], keys[0]]);
+    }}
+  }});
+  DATA.clips.forEach((c, ci) => {{
+    if (clipState[ci].action === 'skipped' && c.ck_child) {{
+      (c.ck_parents || []).forEach(ckp => {{ if (ckp) {{ const a=c.ck_child<=ckp?c.ck_child:ckp, b=c.ck_child<=ckp?ckp:c.ck_child; pairs.push([a,b]); }} }});
+    }}
+  }});
+  const seen = new Set();
+  const unique = pairs.filter(p => {{ const k=p[0]+':'+p[1]; if (seen.has(k)) return false; seen.add(k); return true; }});
+  const data = JSON.stringify({{ dismissed_pairs: unique }}, null, 2);
+  const blob = new Blob([data], {{ type: 'application/json' }});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'vcd_dismissed.json'; a.click(); URL.revokeObjectURL(a.href);
 }}
 
 init();
@@ -1923,6 +1845,7 @@ def main():
     parser.add_argument('--clear-comparisons', action='store_true', help='Clear comparisons only')
     parser.add_argument('--clear-failed', action='store_true', help='Clear failed file list')
     parser.add_argument('--cleanup-cache', action='store_true', help='Remove cached data for files no longer in scanned dirs')
+    parser.add_argument('--clear-dismissed', action='store_true', help='Re-show previously skipped groups')
     parser.add_argument('--timeout', type=int, default=600, help='Timeout per file (default: 600)')
     parser.add_argument('--no-prompt', action='store_true', help='Skip interactive setup')
     args = parser.parse_args()
@@ -1986,6 +1909,7 @@ def main():
         cache.clear_fingerprints()
         cache.clear_comparisons()
         cache.clear_failed()
+        cache.clear_dismissed()
         print("🗑️  All caches cleared")
     if args.clear_comparisons:
         cache.clear_comparisons()
@@ -1993,6 +1917,23 @@ def main():
     if args.clear_failed:
         cache.clear_failed()
         print("🗑️  Failed list cleared")
+    if args.clear_dismissed:
+        cache.clear_dismissed()
+        print("🗑️  Dismissed groups cleared — all groups will appear in next report")
+
+    # Auto-import dismissed pairs from HTML report (vcd_dismissed.json)
+    dismissed_json_path = os.path.join(script_dir, 'vcd_dismissed.json')
+    if os.path.exists(dismissed_json_path):
+        try:
+            with open(dismissed_json_path, 'r', encoding='utf-8') as f:
+                dismissed_data = json.load(f)
+            pairs = [(p[0], p[1]) for p in dismissed_data.get('dismissed_pairs', []) if len(p) == 2]
+            if pairs:
+                cache.batch_add_dismissed(pairs)
+                print(f"📥 Imported {len(pairs)} dismissed pairs from vcd_dismissed.json")
+            os.remove(dismissed_json_path)
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            print(f"⚠️  Could not import vcd_dismissed.json: {e}")
 
     has_cli_config = (args.workers > 0 or args.compare_workers > 0 or args.clip_ratio > 0
                       or args.dup_ratio > 0 or args.intro_filter >= 0 or args.no_prompt)
@@ -2019,7 +1960,7 @@ def main():
 
     cache.validate_params(config)
 
-    print(f"\n⚙️ Settings:")
+    print(f"\n⚙️  Settings:")
     print(f"   Extraction workers:  {config.max_workers}")
     print(f"   Comparison workers:  {config.comparison_workers}")
     print(f"   Clip threshold:      {config.clip_match_ratio:.0%}")
@@ -2394,6 +2335,9 @@ def main():
     # Phase 4: Safe grouping
     print("\n📋 Phase 4: Grouping results...")
     
+    # Load dismissed pairs for previously-skipped detection
+    dismissed_pairs = cache.get_all_dismissed()
+    
     # Build path-based fingerprints dict for reporting
     # Map each path to its fingerprint data (via content_key)
     path_fingerprints = {}
@@ -2421,6 +2365,7 @@ def main():
         dup_groups_raw[root].append(path)
 
     dup_groups, keep_set, dup_delete_set = [], set(), set()
+    prev_skipped_dup = 0
     for gp in dup_groups_raw.values():
         if len(gp) < 2:
             keep_set.add(gp[0])
@@ -2434,9 +2379,27 @@ def main():
         sizes = [path_fingerprints[p]['file_size'] for p in sg]
         
         # Check if this group is byte-for-byte identical
-        # (all paths have the same content_key)
-        content_keys_in_group = set(path_fingerprints[p]['content_key'] for p in sg)
+        content_keys_in_group = list(set(path_fingerprints[p]['content_key'] for p in sg))
         is_identical = len(content_keys_in_group) == 1
+        
+        # Check if ALL content_key pairs in this group were previously dismissed
+        all_dismissed = True
+        if len(content_keys_in_group) >= 2:
+            for ii in range(len(content_keys_in_group)):
+                for jj in range(ii + 1, len(content_keys_in_group)):
+                    nk = (content_keys_in_group[ii], content_keys_in_group[jj]) if content_keys_in_group[ii] <= content_keys_in_group[jj] else (content_keys_in_group[jj], content_keys_in_group[ii])
+                    if nk not in dismissed_pairs:
+                        all_dismissed = False
+                        break
+                if not all_dismissed:
+                    break
+        else:
+            # Identical files (1 content_key) — check if the single "self-pair" was dismissed
+            sk = content_keys_in_group[0]
+            all_dismissed = (sk, sk) in dismissed_pairs
+        
+        if all_dismissed:
+            prev_skipped_dup += 1
         
         dup_groups.append({
             'recommend_keep': sg[0],
@@ -2444,6 +2407,8 @@ def main():
             'potential_savings': sum(path_fingerprints[p]['file_size'] for p in sg[1:]),
             'size_warning': (max(sizes) / max(min(sizes), 1)) > 3.0 if not is_identical else False,
             'identical': is_identical,
+            'content_keys': content_keys_in_group,
+            'previously_skipped': all_dismissed,
             'videos': [
                 {
                     'path': p, 
@@ -2453,7 +2418,7 @@ def main():
                 for p in sg
             ],
         })
-    dup_groups.sort(key=lambda g: g['potential_savings'], reverse=True)
+    dup_groups.sort(key=lambda g: (g['previously_skipped'], -g['potential_savings']))
 
     # Clip relationships
     clip_children = defaultdict(list)
@@ -2476,6 +2441,24 @@ def main():
         if kept:
             clip_deletions.append((child, [p for p, _ in kept], max(r for _, r in kept)))
     clip_deletions.sort(key=lambda x: path_fingerprints[x[0]]['file_size'], reverse=True)
+
+    # Build dismissed info for clips
+    clip_dismissed = []
+    clip_content_keys = []
+    for child, parents, ratio in clip_deletions:
+        ck_child = path_fingerprints.get(child, {}).get('content_key', '')
+        ck_parents = [path_fingerprints.get(p, {}).get('content_key', '') for p in parents]
+        is_dismissed = all(
+            ((ck_child, ckp) if ck_child <= ckp else (ckp, ck_child)) in dismissed_pairs
+            for ckp in ck_parents if ckp
+        ) if ck_child and ck_parents else False
+        clip_dismissed.append(is_dismissed)
+        clip_content_keys.append((ck_child, ck_parents))
+    
+    prev_skipped_groups = sum(1 for g in dup_groups if g.get('previously_skipped'))
+    prev_skipped_clips = sum(1 for d in clip_dismissed if d)
+    if prev_skipped_groups or prev_skipped_clips:
+        print(f"   Previously skipped: {prev_skipped_groups} dup groups, {prev_skipped_clips} clips (hidden by default)")
 
     # Output
     display_root = root_dirs[0]
@@ -2656,14 +2639,14 @@ def main():
         f.write('pause\n')
 
     # Interactive HTML report
-    _generate_html_report(results_dir, dup_groups, clip_deletions, path_fingerprints, display_root, total_delete, total_savings, partial=partial_results)
+    _generate_html_report(results_dir, dup_groups, clip_deletions, clip_dismissed, clip_content_keys, path_fingerprints, display_root, total_delete, total_savings, partial=partial_results)
 
     print(f"\n📄 Results saved to: {results_dir}")
     print("   - review_results.html     (interactive — open in browser)")
     print("   - duplicate_report.json")
     print("   - delete_duplicates.bat   (cmd.exe)")
     print("   - delete_duplicates.ps1   (PowerShell — handles long paths)")
-    print("   - RUN_CUSTOM_ACTIONS.bat  (launches custom .ps1 with bypass)")
+    print("   - RUN_CUSTOM_ACTIONS.bat       (launches PowerShell with bypass)")
     if _debug_logger and _debug_logger.handlers:
         print("   - fpcalc_debug.log        (anonymized failure details)")
     print(f"\n   Total: {total_delete} files, {format_size(total_savings)} savings")
