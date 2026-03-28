@@ -1022,7 +1022,7 @@ def _drain_stderr(pipe, result_holder):
     try:
         result_holder[0] = pipe.read(4096)
         pipe.read()
-    except Exception:
+    except (OSError, ValueError):
         pass
 
 def _kill_proc(proc):
@@ -1031,7 +1031,7 @@ def _kill_proc(proc):
     try:
         proc.kill()
         proc.wait(timeout=5)
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
 def _get_short_path(long_path: str) -> str:
@@ -1061,7 +1061,7 @@ def _get_short_path(long_path: str) -> str:
             result = result[4:]  # \\?\C:\path → C:\path
         
         return result
-    except Exception:
+    except (OSError, AttributeError, ValueError):
         return long_path
 
 # Characters that cause fpcalc/FFmpeg to choke
@@ -1897,7 +1897,7 @@ def main():
     # Configuration
     try:
         cpu_count = multiprocessing.cpu_count()
-    except Exception:
+    except (NotImplementedError, OSError):
         cpu_count = 4
 
     script_dir = _BASE_DIR
