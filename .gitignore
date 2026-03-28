@@ -1,0 +1,12 @@
+# Ignore everything (files and folders) by default
+*
+
+# Explicitly ignore Claude Code config
+.claude/
+
+# Things that are uploaded
+!VidClipDupli.py
+!README.md
+!LICENSE
+!requirements.txt
+!.gitignore
